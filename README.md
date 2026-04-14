@@ -218,12 +218,39 @@ For the full 19-pattern analysis, add error, denial, and session tracking hooks.
 
 The enriched PostToolUse hook also captures file paths and search patterns, enabling per-file redundant re-read breakdowns and repeated discovery detection.
 
-## Claude Code Skill (Optional)
+## Install as Claude Code Plugin
 
-To use as a `/efficiency` slash command:
+Add to your `~/.claude/settings.json`:
+
+```json
+{
+  "extraKnownMarketplaces": {
+    "petkoivanov": {
+      "source": {
+        "source": "github",
+        "repo": "petkoivanov/cc-efficiency"
+      }
+    }
+  },
+  "enabledPlugins": {
+    "cc-efficiency@petkoivanov": true
+  }
+}
+```
+
+This registers the `/efficiency` skill so you can invoke it from any Claude Code session.
+
+You still need the hook (step 1 above) and the script on disk:
 
 ```bash
-cp -r skill ~/.claude/skills/efficiency
+mkdir -p ~/.claude/tools
+cp cc_efficiency.py ~/.claude/tools/
+```
+
+### Manual install (without plugin system)
+
+```bash
+cp -r skills/efficiency ~/.claude/skills/efficiency
 mkdir -p ~/.claude/tools
 cp cc_efficiency.py ~/.claude/tools/
 ```

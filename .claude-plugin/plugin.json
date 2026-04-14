@@ -1,0 +1,12 @@
+{
+  "name": "cc-efficiency",
+  "description": "Detect wasteful patterns in Claude Code usage, estimate token overhead, and get actionable recommendations to save tokens and move faster. 19 anti-pattern detectors across tool usage, session behavior, prompts, and context overhead.",
+  "version": "1.0.0",
+  "author": {
+    "name": "Petko Ivanov"
+  },
+  "homepage": "https://github.com/petkoivanov/cc-efficiency",
+  "repository": "https://github.com/petkoivanov/cc-efficiency",
+  "license": "MIT",
+  "keywords": ["efficiency", "analysis", "optimization", "tokens", "performance", "waste-detection"]
+}
