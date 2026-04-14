@@ -249,6 +249,609 @@ def detect_websearch_for_local(sessions):
     }
 
 
+# ── Tier 1 Detectors (new) ───────────────────────────────
+
+def detect_redundant_rereads(sessions):
+    """Same file Read multiple times in one session — the #1 waste pattern.
+
+    Each re-read injects the full file content into context again.
+    Works best with enriched hook data (file path in events).
+    Falls back to counting consecutive Read calls when paths unavailable.
+    """
+    total_rereads = 0
+    total_reads = 0
+    worst_files = Counter()
+
+    for sid, events in sessions.items():
+        files_read = Counter()
+        for e in events:
+            if e.get("tool") == "Read":
+                total_reads += 1
+                fp = e.get("file", "")
+                if fp:
+                    files_read[fp] += 1
+        for fp, count in files_read.items():
+            if count > 1:
+                dupes = count - 1
+                total_rereads += dupes
+                worst_files[fp] += dupes
+
+    has_paths = any(e.get("file") for s in sessions.values() for e in s if e.get("tool") == "Read")
+
+    if not has_paths:
+        # Fallback: estimate from consecutive Read calls (no path data)
+        for sid, events in sessions.items():
+            consec_reads = 0
+            for e in events:
+                if e.get("tool") == "Read":
+                    consec_reads += 1
+                else:
+                    if consec_reads > 2:
+                        total_rereads += consec_reads - 1
+                    consec_reads = 0
+        total_reads = sum(1 for s in sessions.values() for e in s if e.get("tool") == "Read")
+
+    # Each re-read wastes ~500-2000 tokens (file content). Use 800 avg.
+    token_waste = total_rereads * 800
+    top_files = worst_files.most_common(5)
+
+    return {
+        "id": "redundant_rereads", "name": "Redundant File Re-reads",
+        "severity": "high" if total_rereads > 50 else "medium" if total_rereads > 15 else "low",
+        "total_reads": total_reads, "redundant_reads": total_rereads,
+        "pct": round(total_rereads / total_reads * 100, 1) if total_reads else 0,
+        "has_paths": has_paths,
+        "worst_files": [{"file": f, "dupes": c} for f, c in top_files],
+        "est_token_waste": token_waste,
+        "recommendation": "Each re-read re-injects the full file into context. Add to CLAUDE.md: "
+                          "'Do not re-read files already in context.' Use offset/limit to read "
+                          "only the section you need instead of the whole file.",
+    }
+
+
+def detect_session_thrashing(events, enhanced_events):
+    """Many short sessions in a short window — hydration overhead.
+
+    Each new session re-ingests system prompt, CLAUDE.md, MEMORY.md,
+    and MCP tool schemas. Short sessions waste that setup cost.
+    """
+    # Group by session, get first/last timestamps and tool count
+    session_info = defaultdict(lambda: {"first": float("inf"), "last": 0, "count": 0})
+    for e in events:
+        if e.get("type") == "PostToolUse":
+            sid = e.get("sessionId", "")
+            ts = e.get("timestamp", 0)
+            session_info[sid]["first"] = min(session_info[sid]["first"], ts)
+            session_info[sid]["last"] = max(session_info[sid]["last"], ts)
+            session_info[sid]["count"] += 1
+
+    # Also get SessionStart events from enhanced data
+    for e in enhanced_events:
+        if e.get("event") == "SessionStart":
+            sid = e.get("sessionId", "")
+            ts = e.get("timestamp", 0)
+            if sid in session_info:
+                session_info[sid]["first"] = min(session_info[sid]["first"], ts)
+
+    short_sessions = [s for s in session_info.values() if s["count"] < 5 and s["count"] > 0]
+    total_sessions = len(session_info)
+
+    # Detect clusters: many short sessions in 2-hour windows
+    short_sorted = sorted(short_sessions, key=lambda x: x["first"])
+    clusters = 0
+    for i, s in enumerate(short_sorted):
+        window = [s2 for s2 in short_sorted[i:i+10]
+                  if s2["first"] - s["first"] < 7200000]  # 2 hours
+        if len(window) >= 3:
+            clusters += 1
+
+    # Each unnecessary session restart costs ~15K tokens (hydration)
+    excess = max(0, len(short_sessions) - int(total_sessions * 0.2))
+    token_waste = excess * 15000
+
+    return {
+        "id": "session_thrashing", "name": "Session Thrashing",
+        "severity": "high" if len(short_sessions) > 15 else "medium" if len(short_sessions) > 5 else "low",
+        "short_sessions": len(short_sessions), "total_sessions": total_sessions,
+        "clusters": clusters,
+        "pct": round(len(short_sessions) / total_sessions * 100, 1) if total_sessions else 0,
+        "est_token_waste": token_waste,
+        "recommendation": "Each new session re-ingests your full system prompt (~15K+ tokens). "
+                          "Batch related questions into one session instead of starting fresh. "
+                          "Use /resume to continue a previous session.",
+    }
+
+
+def detect_retry_storms(events, enhanced_events):
+    """Same tool called 3+ times in 30s — likely retrying after errors.
+
+    Each retry re-sends the full context plus the error message.
+    """
+    # Use enhanced events for error data
+    error_events = [e for e in enhanced_events if e.get("event") == "PostToolUseFailure"]
+    error_sessions = defaultdict(list)
+    for e in error_events:
+        error_sessions[e.get("sessionId", "")].append(e)
+
+    storms = []
+    for sid, errors in error_sessions.items():
+        errors.sort(key=lambda x: x.get("timestamp", 0))
+        window = []
+        for e in errors:
+            ts = e.get("timestamp", 0)
+            window = [w for w in window if ts - w.get("timestamp", 0) < 30000]
+            window.append(e)
+            if len(window) >= 3:
+                tools = Counter(w.get("tool", "?") for w in window)
+                storms.append({
+                    "session": sid[:8],
+                    "tool": tools.most_common(1)[0][0],
+                    "count": len(window),
+                    "errors": [w.get("error", "")[:60] for w in window[:3]],
+                })
+                window = []
+
+    # Also detect from dashboard events: same tool 3+ times in rapid succession
+    # (even without error data, rapid repeats suggest retries)
+    if not error_events:
+        for sid, sess_events in group_by_session(events).items():
+            for i in range(2, len(sess_events)):
+                e0, e1, e2 = sess_events[i-2], sess_events[i-1], sess_events[i]
+                if (e0.get("tool") == e1.get("tool") == e2.get("tool")
+                        and e2["timestamp"] - e0["timestamp"] < 30000
+                        and e0.get("tool") in ("Bash", "Edit", "Write")):
+                    storms.append({
+                        "session": sid[:8],
+                        "tool": e0.get("tool", "?"),
+                        "count": 3,
+                        "errors": ["(no error data -- install enhanced hooks)"],
+                    })
+
+    token_waste = sum(s["count"] * 2000 for s in storms)
+    error_tools = Counter(s["tool"] for s in storms)
+
+    return {
+        "id": "retry_storms", "name": "Tool Failure Retry Storms",
+        "severity": "high" if len(storms) > 10 else "medium" if len(storms) > 3 else "low",
+        "storms": len(storms),
+        "total_retries": sum(s["count"] for s in storms),
+        "worst_tools": dict(error_tools.most_common(5)),
+        "examples": storms[:5],
+        "est_token_waste": token_waste,
+        "recommendation": "Each retry re-sends full context + error. Common causes: wrong file "
+                          "path, stale old_string in Edit, shell syntax errors. Read the file "
+                          "before editing to ensure old_string matches. Test commands mentally "
+                          "before running them.",
+    }
+
+
+def detect_speculative_reading(sessions):
+    """Files Read but never acted upon — browsing without purpose.
+
+    High read-to-action ratio means the model is exploring broadly
+    instead of targeted investigation.
+    """
+    total_reads = 0
+    total_actions = 0
+    unacted_reads = 0
+    has_paths = False
+
+    for sid, events in sessions.items():
+        files_read = set()
+        files_acted = set()
+        read_count = 0
+        action_count = 0
+
+        for e in events:
+            tool = e.get("tool", "")
+            fp = e.get("file", "")
+            if tool == "Read":
+                read_count += 1
+                if fp:
+                    files_read.add(fp)
+                    has_paths = True
+            elif tool in ("Edit", "Write"):
+                action_count += 1
+                if fp:
+                    files_acted.add(fp)
+
+        total_reads += read_count
+        total_actions += action_count
+
+        if has_paths:
+            unacted = files_read - files_acted
+            unacted_reads += len(unacted)
+
+    # Fallback: use ratio when no paths
+    if not has_paths and total_actions > 0:
+        ratio = total_reads / total_actions
+        # Estimate: if ratio >5:1, about 60% of reads are speculative
+        if ratio > 5:
+            unacted_reads = int(total_reads * 0.6)
+        elif ratio > 3:
+            unacted_reads = int(total_reads * 0.3)
+
+    token_waste = unacted_reads * 600  # Conservative: avg file ~600 tokens
+
+    return {
+        "id": "speculative_reading", "name": "Speculative Reading",
+        "severity": "medium" if unacted_reads > 30 else "low",
+        "total_reads": total_reads, "total_actions": total_actions,
+        "unacted_reads": unacted_reads, "has_paths": has_paths,
+        "ratio": round(total_reads / total_actions, 1) if total_actions else 0,
+        "est_token_waste": token_waste,
+        "recommendation": "Reading files without acting on them wastes context tokens. "
+                          "Use Grep to narrow down before reading full files. Ask Claude "
+                          "to explain its plan before exploring broadly.",
+    }
+
+
+# ── Tier 2 Detectors (new) ───────────────────────────────
+
+def detect_vague_prompts(history, events):
+    """Short/vague prompts that trigger expensive exploration.
+
+    A prompt like 'fix the bug' triggers wide search. 'Fix null pointer
+    in core/graph.py:234' goes straight to the target.
+    """
+    sessions = group_by_session(events)
+    prompt_by_session = defaultdict(list)
+    for h in history:
+        prompt_by_session[h.get("sessionId", "")].append(h)
+
+    expensive_prompts = []
+    total_prompts = len(history)
+
+    for sid, prompts in prompt_by_session.items():
+        if sid not in sessions:
+            continue
+        sess_events = sessions[sid]
+
+        for p in prompts:
+            text = p.get("display", "")
+            ts = p.get("timestamp", 0)
+            words = len(text.split())
+
+            # Skip very short confirmations (yes, ok, continue, etc.)
+            if words <= 2:
+                continue
+
+            # Count exploration tools triggered after this prompt
+            # (within 60s or until next prompt)
+            next_prompt_ts = float("inf")
+            for p2 in prompts:
+                if p2["timestamp"] > ts:
+                    next_prompt_ts = min(next_prompt_ts, p2["timestamp"])
+                    break
+
+            explore_calls = 0
+            action_calls = 0
+            for e in sess_events:
+                ets = e.get("timestamp", 0)
+                if ets <= ts or ets > next_prompt_ts:
+                    continue
+                tool = e.get("tool", "")
+                if tool in ("Grep", "Glob", "Read", "WebSearch", "ToolSearch", "Agent"):
+                    explore_calls += 1
+                elif tool in ("Edit", "Write"):
+                    action_calls += 1
+
+            # Vague if: short prompt + high exploration before action
+            if words < 20 and explore_calls > 8 and action_calls == 0:
+                expensive_prompts.append({
+                    "text": text[:80],
+                    "words": words,
+                    "explore_calls": explore_calls,
+                    "session": sid[:8],
+                })
+
+    token_waste = sum(p["explore_calls"] * 500 for p in expensive_prompts)
+
+    return {
+        "id": "vague_prompts", "name": "Vague Prompt Penalty",
+        "severity": "medium" if len(expensive_prompts) > 5 else "low",
+        "total_prompts": total_prompts,
+        "expensive_count": len(expensive_prompts),
+        "examples": sorted(expensive_prompts, key=lambda x: -x["explore_calls"])[:5],
+        "est_token_waste": token_waste,
+        "recommendation": "Specific prompts save tokens. Instead of 'fix the bug', say "
+                          "'fix the null pointer in core/graph.py line 234'. Including a "
+                          "file path or function name can eliminate 5-10 exploration calls.",
+    }
+
+
+def detect_repeated_discovery(events):
+    """Same Grep/Glob patterns across multiple sessions — forgetting where things are.
+
+    If the model searches for 'class ReactyxState' in the first 10 calls of every
+    session, that location should be in CLAUDE.md.
+    """
+    sessions = group_by_session(events)
+    # Track patterns in early session calls (first 15 tool calls)
+    early_patterns = defaultdict(set)  # pattern -> set of sessions
+
+    for sid, sess_events in sessions.items():
+        seen = set()
+        for e in sess_events[:15]:
+            tool = e.get("tool", "")
+            pattern = e.get("pattern", "")
+            if tool in ("Grep", "Glob") and pattern and pattern not in seen:
+                early_patterns[pattern].add(sid)
+                seen.add(pattern)
+
+    repeated = {p: sids for p, sids in early_patterns.items() if len(sids) >= 3}
+    has_patterns = any(e.get("pattern") for s in sessions.values() for e in s[:15])
+
+    # Each repeated discovery wastes ~2 tool calls (Grep + Read) x ~500 tokens
+    token_waste = sum(len(sids) * 1000 for sids in repeated.values())
+
+    return {
+        "id": "repeated_discovery", "name": "Repeated File Discovery",
+        "severity": "medium" if len(repeated) > 3 else "low",
+        "repeated_patterns": len(repeated),
+        "examples": [{"pattern": p, "sessions": len(s)} for p, s in
+                     sorted(repeated.items(), key=lambda x: -len(x[1]))[:5]],
+        "has_patterns": has_patterns,
+        "est_token_waste": token_waste,
+        "recommendation": "The same searches repeat across sessions because Claude forgets "
+                          "where things are. Add key file locations to CLAUDE.md: "
+                          "'Main state: reactyx/reactyx.py, Graph: core/graph.py'. "
+                          "This eliminates early-session discovery overhead.",
+    }
+
+
+def detect_edit_without_read(events, enhanced_events):
+    """Edit attempted on a file not yet read — fails, then re-does with Read first.
+
+    Doubles the output tokens for that edit.
+    """
+    # Look for Edit failures with "not read" in error message
+    edit_failures = [e for e in enhanced_events
+                     if e.get("event") == "PostToolUseFailure"
+                     and e.get("tool") == "Edit"
+                     and "read" in e.get("error", "").lower()]
+
+    # Also detect from event sequences: Edit failure followed by Read then Edit
+    sessions = group_by_session(events)
+    sequence_count = 0
+    for sid, sess_events in sessions.items():
+        for i in range(2, len(sess_events)):
+            e0, e1, e2 = sess_events[i-2], sess_events[i-1], sess_events[i]
+            # Pattern: Edit -> Read -> Edit (likely failed first edit)
+            if (e0.get("tool") == "Edit" and e1.get("tool") == "Read"
+                    and e2.get("tool") == "Edit"
+                    and e2["timestamp"] - e0["timestamp"] < 15000):
+                sequence_count += 1
+
+    count = max(len(edit_failures), sequence_count)
+    # Each wastes ~2x output tokens for the edit (~1500 tokens)
+    token_waste = count * 1500
+
+    return {
+        "id": "edit_without_read", "name": "Edit Without Prior Read",
+        "severity": "medium" if count > 10 else "low",
+        "count": count, "from_errors": len(edit_failures), "from_sequences": sequence_count,
+        "est_token_waste": token_waste,
+        "recommendation": "Claude sometimes tries to edit a file it hasn't read, fails, then "
+                          "reads and retries. This doubles the output tokens. Add to CLAUDE.md: "
+                          "'Always Read a file before attempting to Edit it.'",
+    }
+
+
+def detect_permission_friction(enhanced_events):
+    """Same tool denied repeatedly — misconfigured permissions."""
+    denials = [e for e in enhanced_events if e.get("event") == "PermissionDenied"]
+    denial_tools = Counter(e.get("tool", "?") for e in denials)
+    repeated = {t: c for t, c in denial_tools.items() if c >= 3}
+
+    # Each denial + replan cycle wastes ~1500 tokens
+    token_waste = sum(c * 1500 for c in repeated.values())
+
+    return {
+        "id": "permission_friction", "name": "Permission Denial Friction",
+        "severity": "medium" if len(repeated) > 2 else "low" if repeated else "low",
+        "total_denials": len(denials),
+        "repeated_tools": repeated,
+        "est_token_waste": token_waste,
+        "recommendation": "Tools denied 3+ times should be auto-allowed or removed. "
+                          "Add to permissions.allow in settings.json. Each denial forces "
+                          "the model to replan, wasting the original approach's tokens.",
+    }
+
+
+# ── Tier 3 Detectors (--deep, transcript parsing) ────────
+
+def _load_transcript_events(projects_dir, since_ts=None):
+    """Load events from transcript JSONL files for deep analysis."""
+    events = []
+    if not projects_dir.exists():
+        return events
+    for proj in projects_dir.iterdir():
+        if not proj.is_dir():
+            continue
+        for f in proj.glob("*.jsonl"):
+            if f.stat().st_size > 100_000_000:  # Skip files >100MB
+                continue
+            try:
+                with open(f, encoding="utf-8", errors="ignore") as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            e = json.loads(line)
+                            ts = e.get("timestamp")
+                            if isinstance(ts, str):
+                                # ISO timestamp
+                                try:
+                                    from datetime import timezone
+                                    dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                                    ts_ms = int(dt.timestamp() * 1000)
+                                except (ValueError, TypeError):
+                                    ts_ms = 0
+                            elif isinstance(ts, (int, float)):
+                                ts_ms = int(ts)
+                            else:
+                                ts_ms = 0
+                            if since_ts and ts_ms < since_ts:
+                                continue
+                            e["_ts_ms"] = ts_ms
+                            e["_file"] = str(f)
+                            events.append(e)
+                        except json.JSONDecodeError:
+                            continue
+            except (OSError, PermissionError):
+                continue
+    return events
+
+
+def detect_compaction_amnesia(transcript_events):
+    """Post-compaction repeated work — model forgets what it already did."""
+    # Look for compaction markers in transcripts
+    compactions = [e for e in transcript_events
+                   if e.get("type") == "queue-operation"
+                   and "compact" in str(e.get("operation", "")).lower()]
+
+    # Without explicit compaction events, look for long sessions
+    # where later tool calls duplicate earlier ones
+    return {
+        "id": "compaction_amnesia", "name": "Post-Compaction Amnesia",
+        "severity": "low",  # Hard to detect without richer data
+        "compaction_events": len(compactions),
+        "est_token_waste": len(compactions) * 20000,
+        "recommendation": "After context compaction, Claude forgets earlier work and may "
+                          "repeat searches or edits. For long sessions, consider breaking "
+                          "work into focused sessions. Put critical context in CLAUDE.md "
+                          "so it survives compaction.",
+    }
+
+
+def detect_claude_md_bloat():
+    """CLAUDE.md size analysis — every token is re-sent every message."""
+    claude_files = []
+    # Check CWD
+    cwd_file = Path.cwd() / "CLAUDE.md"
+    if cwd_file.exists():
+        size = cwd_file.stat().st_size
+        tokens = size // 4
+        claude_files.append({"path": str(cwd_file), "bytes": size, "tokens": tokens})
+    # Check home
+    home_file = Path.home() / ".claude" / "CLAUDE.md"
+    if home_file.exists():
+        size = home_file.stat().st_size
+        tokens = size // 4
+        claude_files.append({"path": str(home_file), "bytes": size, "tokens": tokens})
+
+    total_tokens = sum(f["tokens"] for f in claude_files)
+    # Over a 50-message session, CLAUDE.md is re-sent 50x as cached input
+    session_cost = total_tokens * 50  # cache reads are cheap but not free
+
+    return {
+        "id": "claude_md_bloat", "name": "CLAUDE.md Size",
+        "severity": "medium" if total_tokens > 8000 else "low",
+        "files": claude_files, "total_tokens": total_tokens,
+        "est_session_cache_reads": session_cost,
+        "est_token_waste": 0,  # Not exactly waste — but worth tracking
+        "recommendation": "CLAUDE.md is re-sent as cached input on every message. "
+                          "At " + str(total_tokens) + " tokens, a 50-message session "
+                          "reads it " + str(session_cost // 1000) + "K times. Keep it "
+                          "focused: remove stale sections, move reference material to "
+                          "separate docs that are Read on demand.",
+    }
+
+
+def detect_subagent_overkill(sessions):
+    """Agent spawns for tasks where direct tool calls would suffice.
+
+    Detects Agent followed by very few productive events — the agent
+    did work that could have been done inline.
+    """
+    agent_sessions = []
+    for sid, events in sessions.items():
+        agents = 0
+        total = len(events)
+        for e in events:
+            if e.get("tool") == "Agent":
+                agents += 1
+        if agents > 0:
+            # Ratio of agents to total work
+            agent_sessions.append({
+                "session": sid[:8],
+                "agents": agents,
+                "total_tools": total,
+                "ratio": round(agents / total * 100, 1) if total else 0,
+            })
+
+    # Flag sessions where agents are >10% of tool calls
+    overkill = [s for s in agent_sessions if s["ratio"] > 10]
+    excess_agents = sum(max(0, s["agents"] - 1) for s in overkill)
+    token_waste = excess_agents * 8000  # Each excess agent ~8K context duplication
+
+    return {
+        "id": "subagent_overkill", "name": "Subagent Overkill",
+        "severity": "medium" if len(overkill) > 3 else "low",
+        "sessions_with_agents": len(agent_sessions),
+        "overkill_sessions": len(overkill),
+        "excess_agents": excess_agents,
+        "worst": sorted(overkill, key=lambda x: -x["ratio"])[:5],
+        "est_token_waste": token_waste,
+        "recommendation": "Agents duplicate the full conversation context (~8K+ tokens each). "
+                          "Sessions with >10% agent calls suggest over-delegation. For simple "
+                          "find-and-replace or single-file edits, direct tools are 5-10x cheaper.",
+    }
+
+
+def detect_conversational_roundtrips(history, events):
+    """Multiple back-and-forth turns before any tool call — clarification waste.
+
+    Each round-trip re-sends the full conversation context.
+    """
+    sessions_events = group_by_session(events)
+    prompt_by_session = defaultdict(list)
+    for h in history:
+        prompt_by_session[h.get("sessionId", "")].append(h)
+
+    chains = []
+    for sid, prompts in prompt_by_session.items():
+        if sid not in sessions_events:
+            continue
+        sess_events = sessions_events[sid]
+        prompts_sorted = sorted(prompts, key=lambda x: x.get("timestamp", 0))
+
+        consecutive_no_tool = 0
+        for i, p in enumerate(prompts_sorted):
+            ts = p.get("timestamp", 0)
+            next_ts = prompts_sorted[i+1]["timestamp"] if i+1 < len(prompts_sorted) else float("inf")
+
+            # Check if any tool calls happened between this prompt and the next
+            tools_between = sum(1 for e in sess_events
+                                if ts < e.get("timestamp", 0) < next_ts)
+            if tools_between == 0:
+                consecutive_no_tool += 1
+            else:
+                if consecutive_no_tool >= 3:
+                    chains.append({
+                        "session": sid[:8],
+                        "rounds": consecutive_no_tool,
+                    })
+                consecutive_no_tool = 0
+
+    total_rounds = sum(c["rounds"] for c in chains)
+    # Each round re-sends growing context: estimate ~5K per round
+    token_waste = total_rounds * 5000
+
+    return {
+        "id": "conversational_roundtrips", "name": "Conversational Round-Trips",
+        "severity": "medium" if len(chains) > 3 else "low",
+        "chains": len(chains), "total_rounds": total_rounds,
+        "examples": sorted(chains, key=lambda x: -x["rounds"])[:5],
+        "est_token_waste": token_waste,
+        "recommendation": "Each clarification round re-sends the full context. Front-load "
+                          "requirements in the initial prompt: what to change, which files, "
+                          "expected behavior. One detailed prompt beats three rounds of Q&A.",
+    }
+
+
 # ── Trends & Metrics ─────────────────────────────────────
 
 def compute_weekly_trends(events):
@@ -669,6 +1272,56 @@ def print_report(findings, trends, tod, mcp, enhanced, period, n_events, n_sessi
                 print(f"     Agent calls: {f['agent_count']} ({f['ratio_pct']}%)  |  Healthy: {f['healthy_range']}")
             elif f["id"] == "websearch_for_local":
                 print(f"     WebSearches: {f['total_websearches']} total, ~{f['likely_local']} likely local")
+            # Tier 1
+            elif f["id"] == "redundant_rereads":
+                print(f"     Redundant reads: {fmt(f['redundant_reads'])} / {fmt(f['total_reads'])} ({f['pct']}%)")
+                if f["worst_files"]:
+                    wf = f["worst_files"][0]
+                    name = Path(wf["file"]).name if wf["file"] else "?"
+                    print(f"     Worst file: {name} ({wf['dupes']} duplicate reads)")
+                if not f["has_paths"]:
+                    print(f"     (Upgrade hooks to get per-file breakdown)")
+            elif f["id"] == "session_thrashing":
+                print(f"     Short sessions (<5 tools): {f['short_sessions']} / {f['total_sessions']} ({f['pct']}%)")
+                if f["clusters"]:
+                    print(f"     Burst clusters (3+ short in 2hrs): {f['clusters']}")
+            elif f["id"] == "retry_storms":
+                print(f"     Retry storms: {f['storms']}  |  Total retries: {f['total_retries']}")
+                if f["worst_tools"]:
+                    tools_str = ", ".join(f"{t}: {c}" for t, c in f["worst_tools"].items())
+                    print(f"     Worst tools: {tools_str}")
+            elif f["id"] == "speculative_reading":
+                print(f"     Read:Action ratio: {f['ratio']}:1  |  Unacted reads: ~{f['unacted_reads']}")
+            # Tier 2
+            elif f["id"] == "vague_prompts":
+                print(f"     Expensive vague prompts: {f['expensive_count']} / {f['total_prompts']}")
+                if f["examples"]:
+                    ex = f["examples"][0]
+                    print(f"     Worst: \"{ex['text'][:50]}...\" -> {ex['explore_calls']} exploration calls")
+            elif f["id"] == "repeated_discovery":
+                print(f"     Repeated search patterns: {f['repeated_patterns']}")
+                if f["examples"]:
+                    for ex in f["examples"][:3]:
+                        print(f"     \"{ex['pattern'][:40]}\" in {ex['sessions']} sessions")
+                if not f["has_patterns"]:
+                    print(f"     (Upgrade hooks to capture grep/glob patterns)")
+            elif f["id"] == "edit_without_read":
+                print(f"     Edit-before-read failures: {f['count']}")
+            elif f["id"] == "permission_friction":
+                print(f"     Total denials: {f['total_denials']}")
+                for tool, cnt in f["repeated_tools"].items():
+                    print(f"     {tool}: denied {cnt}x")
+            # Tier 3
+            elif f["id"] == "compaction_amnesia":
+                print(f"     Compaction events detected: {f['compaction_events']}")
+            elif f["id"] == "claude_md_bloat":
+                print(f"     CLAUDE.md size: ~{fmt(f['total_tokens'])} tokens")
+                for cf in f["files"]:
+                    print(f"     {cf['path']}: {cf['bytes']:,} bytes")
+            elif f["id"] == "subagent_overkill":
+                print(f"     Overkill sessions: {f['overkill_sessions']}  |  Excess agents: {f['excess_agents']}")
+            elif f["id"] == "conversational_roundtrips":
+                print(f"     Clarification chains: {f['chains']}  |  Total rounds: {f['total_rounds']}")
 
             print(f"     Est. token waste: ~{fmt(waste)}")
             print(wrap(f["recommendation"]))
@@ -742,6 +1395,8 @@ def main():
     parser.add_argument("--json", action="store_true", help="Output JSON instead of formatted report")
     parser.add_argument("--context-audit", action="store_true",
                         help="Audit context overhead: MCP servers, skills, plugins loaded but unused")
+    parser.add_argument("--deep", action="store_true",
+                        help="Deep analysis: parse transcripts for compaction, bloat, round-trips")
     parser.add_argument("--project", type=str, default=None,
                         help="Project directory to scan for .mcp.json and CLAUDE.md (default: CWD)")
     args = parser.parse_args()
@@ -768,10 +1423,13 @@ def main():
         sys.exit(1)
 
     sessions = group_by_session(events)
+    history = load_jsonl(HISTORY_FILE, since_ts)
+    enhanced_events = load_jsonl(EFFICIENCY_DB, since_ts)
     n_events = sum(1 for e in events if e.get("type") == "PostToolUse")
     n_sessions = len(sessions)
 
-    findings = sorted([
+    # Original 7 detectors
+    findings = [
         detect_bash_overuse(sessions),
         detect_search_churn(sessions),
         detect_toolsearch_overhead(events),
@@ -779,7 +1437,30 @@ def main():
         detect_rapid_fire_edits(sessions),
         detect_agent_overuse(sessions),
         detect_websearch_for_local(sessions),
-    ], key=lambda f: ({"high": 0, "medium": 1, "low": 2}[f["severity"]], -f.get("est_token_waste", 0)))
+        # Tier 1
+        detect_redundant_rereads(sessions),
+        detect_session_thrashing(events, enhanced_events),
+        detect_retry_storms(events, enhanced_events),
+        detect_speculative_reading(sessions),
+        # Tier 2
+        detect_vague_prompts(history, events),
+        detect_repeated_discovery(events),
+        detect_edit_without_read(events, enhanced_events),
+        detect_permission_friction(enhanced_events),
+    ]
+
+    # Tier 3 (--deep)
+    if args.deep:
+        projects_dir = CLAUDE_DIR / "projects"
+        transcript_events = _load_transcript_events(projects_dir, since_ts)
+        findings.extend([
+            detect_compaction_amnesia(transcript_events),
+            detect_claude_md_bloat(),
+            detect_subagent_overkill(sessions),
+            detect_conversational_roundtrips(history, events),
+        ])
+
+    findings.sort(key=lambda f: ({"high": 0, "medium": 1, "low": 2}[f["severity"]], -f.get("est_token_waste", 0)))
 
     trends = compute_weekly_trends(events)
     tod = compute_time_of_day(events)

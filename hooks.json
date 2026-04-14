@@ -12,7 +12,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node -e \"process.stdin.resume();let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{try{const e=JSON.parse(d);const line=JSON.stringify({type:e.hook_event_name,tool:e.tool_name,sessionId:e.session_id,timestamp:Date.now()})+'\\n';require('fs').appendFileSync(require('path').join(require('os').homedir(),'.claude','.dashboard-events.jsonl'),line)}catch(err){}})\""
+            "command": "node -e \"process.stdin.resume();let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{try{const e=JSON.parse(d);const i=e.tool_input||{};const meta={};if(i.file_path)meta.file=i.file_path;if(i.pattern)meta.pattern=i.pattern;if(i.command)meta.cmd=String(i.command).slice(0,120);if(i.prompt)meta.prompt=String(i.prompt).slice(0,80);if(i.query)meta.query=String(i.query).slice(0,80);if(i.description)meta.desc=String(i.description).slice(0,80);const line=JSON.stringify({type:e.hook_event_name,tool:e.tool_name,sessionId:e.session_id,timestamp:Date.now(),...meta})+'\\n';require('fs').appendFileSync(require('path').join(require('os').homedir(),'.claude','.dashboard-events.jsonl'),line)}catch(err){}})\""
           }
         ]
       }

@@ -101,7 +101,9 @@ FINDINGS
 ----------------------------------------------------------------
 ```
 
-## What It Detects
+## What It Detects (19 Patterns)
+
+### Core Patterns (always run)
 
 | Pattern | Signal | Token Cost | Fix |
 |---------|--------|------------|-----|
@@ -112,6 +114,33 @@ FINDINGS
 | **Rapid-Fire Edits** | 4+ Edits in 10s | ~200/edit | Batch related changes in one request |
 | **Agent Overuse** | Agent >5% of tool calls | ~6,000/spawn | Use Grep/Read for simple lookups |
 | **WebSearch for Local** | WebSearch then local search | ~1,500/call | Search codebase first |
+
+### Tier 1 -- High Impact (always run)
+
+| Pattern | Signal | Token Cost | Fix |
+|---------|--------|------------|-----|
+| **Redundant Re-reads** | Same file Read multiple times/session | ~800/re-read | Add "don't re-read" to CLAUDE.md |
+| **Session Thrashing** | Many sessions with <5 tool calls | ~15,000/session | Batch work into fewer sessions |
+| **Retry Storms** | Same tool fails 3+ times in 30s | ~2,000/retry | Read before Edit; check paths exist |
+| **Speculative Reading** | Files Read but never edited | ~600/unused read | Grep first, then Read only matches |
+
+### Tier 2 -- Behavioral (always run)
+
+| Pattern | Signal | Token Cost | Fix |
+|---------|--------|------------|-----|
+| **Vague Prompt Penalty** | Short prompt -> 8+ exploration calls | ~500/explore call | Include file paths in prompts |
+| **Repeated Discovery** | Same Grep/Glob pattern in 3+ sessions | ~1,000/repeat | Add key paths to CLAUDE.md |
+| **Edit Without Read** | Edit fails -> Read -> Edit retry | ~1,500/failure | Always Read before Edit |
+| **Permission Friction** | Same tool denied 3+ times | ~1,500/denial | Auto-allow in settings.json |
+
+### Tier 3 -- Deep Analysis (`--deep` flag)
+
+| Pattern | Signal | Token Cost | Fix |
+|---------|--------|------------|-----|
+| **Compaction Amnesia** | Repeated work after context compaction | ~20,000/event | Break into shorter sessions |
+| **CLAUDE.md Bloat** | Large CLAUDE.md re-sent every message | cache overhead | Trim stale sections |
+| **Subagent Overkill** | Agents >10% of session tools | ~8,000/excess | Direct tools for simple tasks |
+| **Conversational Round-Trips** | 3+ prompts with no tool calls | ~5,000/round | Front-load requirements |
 
 ## Weekly Trends
 
