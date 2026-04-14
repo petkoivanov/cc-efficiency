@@ -38,6 +38,14 @@ TOKEN_COSTS = {
     "web_search_local": 1500,
 }
 
+# Context cost heuristics (tokens per item loaded into system prompt)
+CONTEXT_COSTS = {
+    "deferred_tool_listing": 15,     # one tool name line in system prompt
+    "loaded_tool_schema": 200,       # full JSON schema when ToolSearch loads it
+    "skill_listing": 30,             # one skill entry in system prompt
+    "mcp_instructions": 150,         # average MCP server instruction block
+}
+
 
 def load_jsonl(path, since_ts=None):
     items = []
@@ -301,6 +309,254 @@ def analyze_enhanced(path, since_ts):
     }
 
 
+# ── Context Audit ────────────────────────────────────────
+
+def _find_mcp_configs():
+    """Find all .mcp.json files (global + project-level).
+
+    Scans: ~/.claude/.mcp.json, CWD/.mcp.json, and any project dirs
+    referenced in recent dashboard events (via session CWD tracking).
+    """
+    configs = {}
+    # Global config
+    global_mcp = CLAUDE_DIR / ".mcp.json"
+    if global_mcp.exists():
+        configs[str(global_mcp)] = ("global", global_mcp)
+    # CWD config
+    cwd_mcp = Path.cwd() / ".mcp.json"
+    if cwd_mcp.exists():
+        configs[str(cwd_mcp)] = ("project", cwd_mcp)
+    # Scan known project dirs from Claude's project index
+    projects_dir = CLAUDE_DIR / "projects"
+    if projects_dir.exists():
+        for proj in projects_dir.iterdir():
+            if not proj.is_dir():
+                continue
+            # Project dir name encodes the path (c--Projects--foo -> c:/Projects/foo)
+            # Try to reconstruct the original path
+            name = proj.name
+            # Common pattern: drive-letter--path--segments
+            parts = name.split("-")
+            if len(parts) >= 2 and len(parts[0]) == 1:
+                # Looks like a path: c-Projects-foo -> c:/Projects/foo
+                drive = parts[0]
+                rest = "/".join(parts[1:])
+                candidate = Path(f"{drive}:/{rest}") / ".mcp.json"
+                if candidate.exists() and str(candidate) not in configs:
+                    configs[str(candidate)] = ("project", candidate)
+    return list(configs.values())
+
+
+def _count_mcp_tools_from_events(events):
+    """Count unique tool names per MCP server from actual usage."""
+    server_tools = defaultdict(set)
+    for e in events:
+        if e.get("type") != "PostToolUse":
+            continue
+        tool = e.get("tool", "")
+        if tool.startswith("mcp__"):
+            parts = tool.split("__")
+            if len(parts) >= 3:
+                server_tools[parts[1]].add(tool)
+    return {k: len(v) for k, v in server_tools.items()}
+
+
+def _estimate_server_tools(server_name, tools_seen):
+    """Estimate total tool count for a server based on observed tools.
+
+    Servers expose many more tools than get used. We estimate the full
+    count based on known server sizes. If unknown, use the observed count
+    with a multiplier (most users only touch 10-30% of available tools).
+    """
+    # Known server sizes (approximate, based on common MCP servers)
+    known = {
+        "claude-flow": 185,
+        "mobile": 70,
+        "playwright": 30,
+        "duckdb": 4,
+        "yfinance": 20,
+        "context7": 2,
+        "sequential-thinking": 1,
+        "filesystem": 8,
+        "github": 25,
+        "postgres": 5,
+        "sqlite": 5,
+        "memory": 6,
+        "fetch": 2,
+        "brave-search": 2,
+        "puppeteer": 15,
+        "slack": 10,
+        "linear": 15,
+        "sentry": 8,
+        "supabase": 20,
+    }
+    if server_name in known:
+        return known[server_name]
+    # Unknown server: use observed tools * 3 (assume ~33% usage), min 5
+    return max(5, tools_seen * 3)
+
+
+def _count_skills():
+    """Count installed skills by scanning the skills directory."""
+    skills_dir = CLAUDE_DIR / "skills"
+    count = 0
+    if skills_dir.exists():
+        for item in skills_dir.iterdir():
+            if item.is_dir() and (item / "SKILL.md").exists():
+                count += 1
+    return count
+
+
+def _count_plugins():
+    """Count enabled plugins from settings.json."""
+    settings_path = CLAUDE_DIR / "settings.json"
+    if not settings_path.exists():
+        return {}
+    try:
+        with open(settings_path) as f:
+            settings = json.load(f)
+        return settings.get("enabledPlugins", {})
+    except (json.JSONDecodeError, KeyError):
+        return {}
+
+
+def _estimate_claude_md_tokens():
+    """Estimate token count of CLAUDE.md files loaded into context."""
+    total_chars = 0
+    # Check CWD
+    cwd_claude = Path.cwd() / "CLAUDE.md"
+    if cwd_claude.exists():
+        total_chars += cwd_claude.stat().st_size
+    # Check parent directories (Claude Code walks up)
+    for parent in Path.cwd().parents:
+        pf = parent / "CLAUDE.md"
+        if pf.exists():
+            total_chars += pf.stat().st_size
+        if parent == parent.parent:
+            break
+    # Check user-level
+    user_claude = Path.home() / ".claude" / "CLAUDE.md"
+    if user_claude.exists():
+        total_chars += user_claude.stat().st_size
+    # Rough: ~4 chars per token for English text
+    return total_chars // 4
+
+
+def _estimate_memory_tokens():
+    """Estimate token count of MEMORY.md."""
+    memory_path = CLAUDE_DIR / "projects"
+    total = 0
+    if memory_path.exists():
+        for proj_dir in memory_path.iterdir():
+            if proj_dir.is_dir():
+                mem_file = proj_dir / "memory" / "MEMORY.md"
+                if mem_file.exists():
+                    total = max(total, mem_file.stat().st_size // 4)
+    return total
+
+
+def audit_context(events, mcp_usage):
+    """Audit context overhead: MCP servers, skills, plugins, CLAUDE.md.
+
+    Returns a dict with per-source token estimates and waste analysis.
+    """
+    # 1. MCP servers
+    mcp_configs = _find_mcp_configs()
+    servers = {}
+    for source, path in mcp_configs:
+        try:
+            with open(path) as f:
+                cfg = json.load(f)
+            for name, server_cfg in cfg.get("mcpServers", {}).items():
+                auto_start = server_cfg.get("autoStart", True)
+                servers[name] = {
+                    "source": source,
+                    "auto_start": auto_start,
+                    "config_path": str(path),
+                }
+        except (json.JSONDecodeError, KeyError):
+            continue
+
+    # 2. Estimate tool counts per server
+    tools_seen_per_server = _count_mcp_tools_from_events(events)
+    calls_per_server = {}
+    for e in events:
+        if e.get("type") != "PostToolUse":
+            continue
+        tool = e.get("tool", "")
+        if tool.startswith("mcp__"):
+            server = tool.split("__")[1]
+            calls_per_server[server] = calls_per_server.get(server, 0) + 1
+
+    mcp_audit = []
+    total_mcp_tools = 0
+    for name, info in servers.items():
+        seen = tools_seen_per_server.get(name, 0)
+        estimated_tools = _estimate_server_tools(name, seen)
+        calls = calls_per_server.get(name, 0)
+        tokens_per_msg = estimated_tools * CONTEXT_COSTS["deferred_tool_listing"]
+        total_mcp_tools += estimated_tools
+        mcp_audit.append({
+            "server": name,
+            "source": info["source"],
+            "auto_start": info["auto_start"],
+            "estimated_tools": estimated_tools,
+            "tools_actually_used": seen,
+            "total_calls": calls,
+            "tokens_per_msg": tokens_per_msg,
+            "status": "unused" if calls == 0 else "light" if calls < 10 else "active",
+        })
+
+    mcp_audit.sort(key=lambda x: (-x["tokens_per_msg"]))
+
+    # 3. Skills & plugins
+    skill_count = _count_skills()
+    plugins = _count_plugins()
+    # Plugins inject additional skills (estimated ~20-40 per plugin)
+    plugin_skill_estimate = len(plugins) * 30
+    total_skills = skill_count + plugin_skill_estimate
+
+    # 4. CLAUDE.md and MEMORY.md
+    claude_md_tokens = _estimate_claude_md_tokens()
+    memory_tokens = _estimate_memory_tokens()
+
+    # 5. Compute totals
+    mcp_tool_tokens = total_mcp_tools * CONTEXT_COSTS["deferred_tool_listing"]
+    mcp_instr_tokens = len(servers) * CONTEXT_COSTS["mcp_instructions"]
+    skill_tokens = total_skills * CONTEXT_COSTS["skill_listing"]
+    total_context = mcp_tool_tokens + mcp_instr_tokens + skill_tokens + claude_md_tokens + memory_tokens
+
+    # 6. Compute waste (unused servers + unused skills estimate)
+    unused_servers = [s for s in mcp_audit if s["status"] == "unused" and s["auto_start"]]
+    unused_mcp_tokens = sum(s["tokens_per_msg"] for s in unused_servers)
+    # Conservatively estimate 70% of skills are never invoked
+    unused_skill_tokens = int(skill_tokens * 0.7)
+    total_waste_per_msg = unused_mcp_tokens + unused_skill_tokens
+
+    return {
+        "mcp_servers": mcp_audit,
+        "total_mcp_tools": total_mcp_tools,
+        "skill_count": total_skills,
+        "local_skills": skill_count,
+        "plugin_count": len(plugins),
+        "plugin_names": list(plugins.keys()),
+        "claude_md_tokens": claude_md_tokens,
+        "memory_tokens": memory_tokens,
+        "breakdown": {
+            "mcp_tool_listings": mcp_tool_tokens,
+            "mcp_instructions": mcp_instr_tokens,
+            "skill_listings": skill_tokens,
+            "claude_md": claude_md_tokens,
+            "memory_md": memory_tokens,
+        },
+        "total_context_per_msg": total_context,
+        "waste_per_msg": total_waste_per_msg,
+        "unused_servers": unused_servers,
+        "unused_mcp_tokens": unused_mcp_tokens,
+        "unused_skill_tokens": unused_skill_tokens,
+    }
+
+
 # ── Report ────────────────────────────────────────────────
 
 SEVERITY_ICON = {"high": "[!!]", "medium": "[! ]", "low": "[  ]"}
@@ -325,7 +581,53 @@ def wrap(text, prefix="     >> ", cont="        ", width=68):
     return "\n".join(lines)
 
 
-def print_report(findings, trends, tod, mcp, enhanced, period, n_events, n_sessions):
+def print_context_audit(ctx):
+    """Print the context overhead audit section."""
+    print("\nCONTEXT OVERHEAD (tokens loaded per message)")
+    print("-" * 64)
+
+    bk = ctx["breakdown"]
+    rows = [
+        ("MCP tool listings", f"~{ctx['total_mcp_tools']} tools", bk["mcp_tool_listings"]),
+        ("MCP server instructions", f"{len(ctx['mcp_servers'])} servers", bk["mcp_instructions"]),
+        ("Skill listings", f"~{ctx['skill_count']} skills", bk["skill_listings"]),
+        ("CLAUDE.md", "", bk["claude_md"]),
+        ("MEMORY.md", "", bk["memory_md"]),
+    ]
+    for label, detail, tokens in rows:
+        detail_str = f"  ({detail})" if detail else ""
+        print(f"  {label:<30}{detail_str:<22} ~{fmt(tokens):>7}")
+    print(f"  {'-' * 52}{'-' * 12}")
+    print(f"  {'TOTAL':<52} ~{fmt(ctx['total_context_per_msg']):>7}")
+
+    # Unused MCP servers
+    if ctx["unused_servers"]:
+        print(f"\n  UNUSED MCP SERVERS (0 calls, still loaded):")
+        for s in ctx["unused_servers"]:
+            print(f"    {s['server']:<25} ~{s['estimated_tools']} tools  "
+                  f"= ~{fmt(s['tokens_per_msg'])} tokens/msg")
+        print(f"    {'-' * 50}")
+        print(f"    Removable MCP overhead:    ~{fmt(ctx['unused_mcp_tokens'])} tokens/msg")
+
+    # Waste summary
+    if ctx["waste_per_msg"] > 0:
+        print(f"\n  ESTIMATED CONTEXT WASTE:     ~{fmt(ctx['waste_per_msg'])} tokens/msg")
+        pct = round(ctx["waste_per_msg"] / ctx["total_context_per_msg"] * 100) if ctx["total_context_per_msg"] else 0
+        print(f"  ({pct}% of context overhead is estimated unused)")
+        print()
+        if ctx["unused_servers"]:
+            names = ", ".join(s["server"] for s in ctx["unused_servers"])
+            print(wrap(f"Consider removing unused MCP servers: {names}. "
+                       f"Each server's tool listings consume tokens in every message "
+                       f"even if you never call them.", prefix="  >> ", cont="     "))
+        if ctx["unused_skill_tokens"] > 500:
+            print(wrap(f"~{ctx['skill_count']} skills are listed in your system prompt. "
+                       f"Plugins ({', '.join(ctx['plugin_names']) or 'none'}) inject "
+                       f"bundled skills -- consider disabling plugins you don't actively use.",
+                       prefix="  >> ", cont="     "))
+
+
+def print_report(findings, trends, tod, mcp, enhanced, period, n_events, n_sessions, context_audit=None):
     print()
     print("=" * 64)
     print("  CLAUDE CODE EFFICIENCY REPORT")
@@ -419,6 +721,9 @@ def print_report(findings, trends, tod, mcp, enhanced, period, n_events, n_sessi
     else:
         print("\n  [Enhanced hooks not yet installed -- see README for setup]")
 
+    if context_audit:
+        print_context_audit(context_audit)
+
     print(f"\n{'=' * 64}\n")
 
 
@@ -435,7 +740,15 @@ def main():
     parser.add_argument("--days", type=int, default=7, help="Analyze last N days (default: 7)")
     parser.add_argument("--all", action="store_true", help="Analyze all time")
     parser.add_argument("--json", action="store_true", help="Output JSON instead of formatted report")
+    parser.add_argument("--context-audit", action="store_true",
+                        help="Audit context overhead: MCP servers, skills, plugins loaded but unused")
+    parser.add_argument("--project", type=str, default=None,
+                        help="Project directory to scan for .mcp.json and CLAUDE.md (default: CWD)")
     args = parser.parse_args()
+
+    if args.project:
+        import os
+        os.chdir(args.project)
 
     if args.all:
         since_ts = None
@@ -472,16 +785,20 @@ def main():
     tod = compute_time_of_day(events)
     mcp = analyze_mcp_adoption(events)
     enhanced = analyze_enhanced(EFFICIENCY_DB, since_ts)
+    ctx = audit_context(events, mcp) if args.context_audit else None
 
     if args.json:
-        print(json.dumps({
+        result = {
             "period": period, "sessions": n_sessions, "total_tool_calls": n_events,
             "generated": datetime.now().isoformat(), "findings": findings,
             "trends": trends, "peak_hours": tod, "mcp_adoption": mcp, "enhanced": enhanced,
             "total_est_token_waste": sum(f.get("est_token_waste", 0) for f in findings),
-        }, indent=2, default=str))
+        }
+        if ctx:
+            result["context_audit"] = ctx
+        print(json.dumps(result, indent=2, default=str))
     else:
-        print_report(findings, trends, tod, mcp, enhanced, period, n_events, n_sessions)
+        print_report(findings, trends, tod, mcp, enhanced, period, n_events, n_sessions, ctx)
 
 
 if __name__ == "__main__":

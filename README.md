@@ -56,6 +56,12 @@ python cc_efficiency.py --all
 
 # Machine-readable JSON
 python cc_efficiency.py --json
+
+# Context overhead audit (MCP servers, skills, plugins)
+python cc_efficiency.py --all --context-audit
+
+# Point at a specific project (for .mcp.json and CLAUDE.md scanning)
+python cc_efficiency.py --all --context-audit --project /path/to/your/project
 ```
 
 ### 3. Read the report
@@ -120,6 +126,30 @@ WEEKLY TRENDS
 
   Bash trend: worsening (23.7% -> 29.6%)
 ```
+
+## Context Audit
+
+The `--context-audit` flag analyzes the hidden token cost of everything loaded into your system prompt -- even when you never use it:
+
+```
+CONTEXT OVERHEAD (tokens loaded per message)
+----------------------------------------------------------------
+  MCP tool listings               (~242 tools)         ~  3,630
+  MCP server instructions         (6 servers)          ~    900
+  Skill listings                  (~93 skills)         ~  2,790
+  CLAUDE.md                                            ~  6,853
+  MEMORY.md                                            ~  2,035
+  ----------------------------------------------------------------
+  TOTAL                                                ~ 16,208
+
+  UNUSED MCP SERVERS (0 calls, still loaded):
+    playwright                ~30 tools  = ~450 tokens/msg
+
+  ESTIMATED CONTEXT WASTE:     ~2,402 tokens/msg
+  (15% of context overhead is estimated unused)
+```
+
+It cross-references configured MCP servers against actual usage from your dashboard events, counts installed skills and plugins, and measures CLAUDE.md size. Use `--project /path` to scan a specific project's `.mcp.json`.
 
 ## Enhanced Hooks (Optional)
 
