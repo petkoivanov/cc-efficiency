@@ -6,6 +6,8 @@ Detects wasteful patterns in your Claude Code usage, estimates token overhead, a
 
 **What it doesn't do:** It never reads your code, prompts, or conversation content. It only analyzes tool call events (which tool, when, which session).
 
+![Example report showing findings, severity levels, and token waste estimates](docs/report-example.png)
+
 ## Quick Start
 
 ### 1. Install the hook (required, one-time)
