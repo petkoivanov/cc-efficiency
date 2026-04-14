@@ -1,0 +1,66 @@
+{
+  "_comment": "Merge these into your ~/.claude/settings.json under the 'hooks' key.",
+  "_instructions": "The 'base' hook generates .dashboard-events.jsonl (required). The 'enhanced' hooks are optional — they capture errors, permission denials, and session starts for richer reports.",
+
+  "hooks": {
+
+    "_comment_base": "=== REQUIRED: generates .dashboard-events.jsonl ===",
+
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node -e \"process.stdin.resume();let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{try{const e=JSON.parse(d);const line=JSON.stringify({type:e.hook_event_name,tool:e.tool_name,sessionId:e.session_id,timestamp:Date.now()})+'\\n';require('fs').appendFileSync(require('path').join(require('os').homedir(),'.claude','.dashboard-events.jsonl'),line)}catch(err){}})\""
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node -e \"process.stdin.resume();let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{try{const e=JSON.parse(d);const line=JSON.stringify({type:e.hook_event_name,tool:e.tool_name,sessionId:e.session_id,timestamp:Date.now()})+'\\n';require('fs').appendFileSync(require('path').join(require('os').homedir(),'.claude','.dashboard-events.jsonl'),line)}catch(err){}})\""
+          }
+        ]
+      }
+    ],
+
+    "_comment_enhanced": "=== OPTIONAL: richer data for error/denial tracking ===",
+
+    "PostToolUseFailure": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node -e \"process.stdin.resume();let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{try{const e=JSON.parse(d);const line=JSON.stringify({event:'PostToolUseFailure',tool:e.tool_name,sessionId:e.session_id,error:String(e.error||'').slice(0,200),timestamp:Date.now()})+'\\n';require('fs').appendFileSync(require('path').join(require('os').homedir(),'.claude','.efficiency-events.jsonl'),line)}catch(err){}})\""
+          }
+        ]
+      }
+    ],
+    "PermissionDenied": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node -e \"process.stdin.resume();let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{try{const e=JSON.parse(d);const line=JSON.stringify({event:'PermissionDenied',tool:e.tool_name,sessionId:e.session_id,reason:String(e.reason||'').slice(0,200),timestamp:Date.now()})+'\\n';require('fs').appendFileSync(require('path').join(require('os').homedir(),'.claude','.efficiency-events.jsonl'),line)}catch(err){}})\""
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node -e \"process.stdin.resume();let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{try{const e=JSON.parse(d);const line=JSON.stringify({event:'SessionStart',sessionId:e.session_id,cwd:e.cwd,timestamp:Date.now()})+'\\n';require('fs').appendFileSync(require('path').join(require('os').homedir(),'.claude','.efficiency-events.jsonl'),line)}catch(err){}})\""
+          }
+        ]
+      }
+    ]
+  }
+}
