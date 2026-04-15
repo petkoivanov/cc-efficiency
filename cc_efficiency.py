@@ -36,6 +36,31 @@ TOKEN_COSTS = {
     "agent_for_simple": 6000,
     "rapid_fire_edits": 200,
     "web_search_local": 1500,
+    "model_premium_simple": 3000,   # Opus premium for Haiku-suitable session
+    "model_premium_routine": 2000,  # Opus premium for Sonnet-suitable session
+}
+
+# Model cost multipliers (relative to Sonnet = 1.0)
+MODEL_COST_MULTIPLIER = {
+    "opus": 5.0,      # $15/$75 vs $3/$15
+    "sonnet": 1.0,    # baseline
+    "haiku": 0.27,    # $0.80/$4 vs $3/$15
+}
+
+# Prompt cache constants
+CACHE_TTL_MS = 300_000              # 5-minute TTL
+CACHE_WRITE_MULTIPLIER = 1.25      # 5-min cache write = 1.25x base input
+CACHE_READ_MULTIPLIER = 0.1        # cache hit = 0.1x base input
+DEFAULT_CONTEXT_TOKENS = 10_000    # fallback when no --context-audit
+
+# Model pricing ($ per million tokens)
+MODEL_PRICING = {
+    "opus": {"label": "Opus 4.6", "input": 5.0, "output": 25.0,
+             "cache_read": 0.50, "cache_write": 6.25},
+    "sonnet": {"label": "Sonnet 4.6", "input": 3.0, "output": 15.0,
+               "cache_read": 0.30, "cache_write": 3.75},
+    "haiku": {"label": "Haiku 4.5", "input": 1.0, "output": 5.0,
+              "cache_read": 0.10, "cache_write": 1.25},
 }
 
 # Context cost heuristics (tokens per item loaded into system prompt)
@@ -103,7 +128,13 @@ def detect_bash_overuse(sessions):
         "est_token_waste": wasted * TOKEN_COSTS["bash_for_search"],
         "recommendation": "Use Grep instead of grep/rg in Bash. Use Read instead of cat/head/tail. "
                           "Use Glob instead of find/ls. Dedicated tools return structured output "
-                          "(fewer tokens) and skip shell overhead.",
+                          "(fewer tokens) and skip shell overhead. "
+                          "TIP: For Bash calls that can't be replaced with dedicated tools "
+                          "(git, tests, builds), output compression tools like RTK "
+                          "(github.com/rtk-ai/rtk) can reduce their output tokens by 70-90%. "
+                          "Note: RTK only affects Bash output -- Read, Grep, Edit, Agent, and "
+                          "prompt cache costs are unchanged. See docs/companion-tools.md for "
+                          "pros, cons, and security considerations.",
     }
 
 
@@ -801,6 +832,301 @@ def detect_subagent_overkill(sessions):
     }
 
 
+def detect_model_selection_inefficiency(sessions, transcript_events=None):
+    """Detects sessions where Opus handles tasks Sonnet or Haiku could do.
+
+    Classifies each session by complexity using tool-pattern heuristics:
+    - Simple (Haiku-suitable): short lookups, few edits, no agents
+    - Routine (Sonnet-suitable): standard edit/test cycles, low agent use
+    - Complex (Opus-justified): multi-step reasoning, heavy agent use
+
+    With --deep, also checks Agent spawns for missing model hints and
+    extracts actual model usage from transcript data.
+    """
+    classifications = []
+    for sid, events_list in sessions.items():
+        tool_counts = Counter(e.get("tool", "") for e in events_list)
+        total_tools = len(events_list)
+
+        if total_tools < 3:
+            continue
+
+        agent_calls = tool_counts.get("Agent", 0)
+        edit_writes = tool_counts.get("Edit", 0) + tool_counts.get("Write", 0)
+        search_calls = (tool_counts.get("Grep", 0) + tool_counts.get("Glob", 0)
+                        + tool_counts.get("Read", 0))
+        distinct_tools = len([k for k, v in tool_counts.items() if v > 0])
+
+        complexity = "complex"
+        recommended = "opus"
+        reason = ""
+
+        # Simple: short sessions, mostly reads/greps, minimal edits, no agents
+        if total_tools <= 10 and edit_writes <= 1 and agent_calls == 0:
+            complexity = "simple"
+            recommended = "haiku"
+            reason = "short lookup/exploration (<= 10 tools, <= 1 edit)"
+        # Exploration-heavy: lots of searching, very few edits
+        elif search_calls > total_tools * 0.6 and edit_writes < 3 and agent_calls == 0:
+            complexity = "simple"
+            recommended = "sonnet"
+            reason = "exploration-heavy (>60% search tools, <3 edits)"
+        # Routine coding: standard edit/test without complex reasoning
+        elif agent_calls == 0 and distinct_tools <= 5 and total_tools <= 30:
+            complexity = "routine"
+            recommended = "sonnet"
+            reason = "standard edit/test cycle (no agents, <= 5 tool types)"
+        # Routine implementation: more edits than exploration, low agent use
+        elif agent_calls <= 1 and edit_writes > search_calls and total_tools <= 50:
+            complexity = "routine"
+            recommended = "sonnet"
+            reason = "implementation-heavy (edits > searches, <= 1 agent)"
+
+        classifications.append({
+            "session": sid[:8],
+            "total_tools": total_tools,
+            "complexity": complexity,
+            "recommended": recommended,
+            "reason": reason,
+            "agents": agent_calls,
+            "edits": edit_writes,
+        })
+
+    # Check Agent spawns that inherit parent model (no explicit model hint)
+    agents_without_model = 0
+    total_agents = 0
+    for sid, events_list in sessions.items():
+        for e in events_list:
+            if e.get("tool") == "Agent":
+                total_agents += 1
+                if not e.get("model"):
+                    agents_without_model += 1
+
+    # With --deep, extract actual model usage from transcripts
+    actual_models = Counter()
+    if transcript_events:
+        for e in transcript_events:
+            model = e.get("model", "")
+            if not model:
+                continue
+            ml = model.lower()
+            if "opus" in ml:
+                actual_models["opus"] += 1
+            elif "sonnet" in ml:
+                actual_models["sonnet"] += 1
+            elif "haiku" in ml:
+                actual_models["haiku"] += 1
+
+    simple = [c for c in classifications if c["complexity"] == "simple"]
+    routine = [c for c in classifications if c["complexity"] == "routine"]
+    complex_ = [c for c in classifications if c["complexity"] == "complex"]
+    total = len(classifications) or 1
+
+    downgrade_pct = round((len(simple) + len(routine)) / total * 100, 1)
+    token_waste = (len(simple) * TOKEN_COSTS["model_premium_simple"]
+                   + len(routine) * TOKEN_COSTS["model_premium_routine"])
+
+    severity = "high" if downgrade_pct > 60 else "medium" if downgrade_pct > 30 else "low"
+
+    return {
+        "id": "model_selection", "name": "Model Selection Inefficiency",
+        "severity": severity,
+        "total_classified": len(classifications),
+        "simple_sessions": len(simple),
+        "routine_sessions": len(routine),
+        "complex_sessions": len(complex_),
+        "downgrade_pct": downgrade_pct,
+        "agents_without_model": agents_without_model,
+        "total_agents": total_agents,
+        "actual_models": dict(actual_models) if actual_models else None,
+        "worst": sorted([c for c in classifications if c["complexity"] != "complex"],
+                        key=lambda x: -x["total_tools"])[:5],
+        "est_token_waste": token_waste,
+        "recommendation": f"WHY MODEL CHOICE MATTERS: Output tokens are never cached and "
+                          f"cost 5x the input price (e.g. Opus: $25/MTok out vs $5/MTok in). "
+                          f"A cheaper model saves on every output token, which is where most "
+                          f"of your spend goes for code generation tasks. "
+                          f"{downgrade_pct}% of your sessions appear routine enough for "
+                          f"Sonnet or Haiku. Use /model to switch mid-session. Set model: "
+                          f"'sonnet' or 'haiku' on Agent spawns for lookup/implementation "
+                          f"tasks. Start sessions with Sonnet and escalate to Opus only for "
+                          f"complex multi-step reasoning.",
+    }
+
+
+def detect_cache_efficiency(sessions, context_tokens=None, waste_tokens=None):
+    """Detects prompt cache under-use and over-use.
+
+    UNDER-USE (not getting value from cache):
+    - Intra-session gaps >5 min → cache expires, next call repays full write
+    - Single-turn sessions → write premium with zero reads
+    - Clustered short sessions → could consolidate into one warm-cache session
+
+    OVER-USE (caching masking waste or costing more than alternatives):
+    - Unused context cached and read every message → cheap but not free
+    - Model crossover: Opus cache reads on simple sessions may cost more
+      than just using a cheaper model without cache benefits
+    """
+    ctx = context_tokens or DEFAULT_CONTEXT_TOKENS
+    unused_ctx = waste_tokens or 0
+
+    cache_expiries = 0
+    single_turn = 0
+    total_potential_reads = 0
+    total_actual_reads = 0
+    expiry_sessions = []
+
+    session_starts = []
+
+    for sid, events_list in sessions.items():
+        if not events_list:
+            continue
+
+        session_starts.append({
+            "session": sid[:8],
+            "start": events_list[0].get("timestamp", 0),
+            "tools": len(events_list),
+        })
+
+        if len(events_list) <= 2:
+            single_turn += 1
+            continue
+
+        # Count gaps > 5 min between consecutive tool calls
+        sess_expiries = 0
+        for i in range(1, len(events_list)):
+            gap = events_list[i].get("timestamp", 0) - events_list[i - 1].get("timestamp", 0)
+            if gap > CACHE_TTL_MS:
+                sess_expiries += 1
+
+        if sess_expiries > 0:
+            expiry_sessions.append({
+                "session": sid[:8],
+                "expiries": sess_expiries,
+                "tools": len(events_list),
+            })
+
+        cache_expiries += sess_expiries
+        potential = len(events_list) - 1  # first call is always a write
+        actual = max(0, potential - sess_expiries)
+        total_potential_reads += potential
+        total_actual_reads += actual
+
+    # Clustered short sessions: 2+ short sessions within 30 min of each other
+    session_starts.sort(key=lambda x: x["start"])
+    consolidatable = 0
+    used = set()
+    for i, s in enumerate(session_starts):
+        if s["tools"] >= 10 or i in used:
+            continue
+        cluster = [i]
+        for j in range(i + 1, min(i + 8, len(session_starts))):
+            if j in used or session_starts[j]["tools"] >= 10:
+                continue
+            if session_starts[j]["start"] - s["start"] < 1_800_000:  # 30 min
+                cluster.append(j)
+        if len(cluster) >= 2:
+            consolidatable += 1
+            used.update(cluster)
+
+    hit_rate = round(total_actual_reads / total_potential_reads * 100, 1) if total_potential_reads else 100.0
+
+    # UNDER-USE waste:
+    # Each expiry pays 1.25x write instead of 1.0x base input.
+    # The 0.25x premium is the direct extra cost; the missed 0.9x savings
+    # (read at 0.1x vs base 1.0x) is an opportunity cost reported separately.
+    write_premium = CACHE_WRITE_MULTIPLIER - 1.0  # 0.25x
+    missed_savings = 1.0 - CACHE_READ_MULTIPLIER  # 0.9x
+    expiry_waste = int(cache_expiries * ctx * write_premium)
+    expiry_missed = int(cache_expiries * ctx * missed_savings)
+    # Single-turn: pay 0.25x write premium with zero reads to amortize
+    single_waste = int(single_turn * ctx * write_premium)
+
+    # OVER-USE waste:
+    # Unused context tokens read from cache every API message.
+    # Claude batches ~3 tool calls per API round-trip on average,
+    # so estimated messages ≈ tool_calls / 3.
+    avg_tools = sum(len(e) for e in sessions.values()) / len(sessions) if sessions else 0
+    est_messages_per_session = max(1, avg_tools / 3)
+    bloat_per_session = round(unused_ctx * CACHE_READ_MULTIPLIER * est_messages_per_session)
+    bloat_total = bloat_per_session * len(sessions)
+
+    # Model crossover note: Opus cache read = $0.50/MTok, Haiku base = $1/MTok
+    # So even cached Opus INPUT is cheaper than uncached Haiku input.
+    # But OUTPUT is never cached: Opus $25 vs Sonnet $15 vs Haiku $5.
+    # Caching does not eliminate the case for model downgrade on output-heavy work.
+
+    total_waste = expiry_waste + single_waste + bloat_total
+
+    # Severity based on hit rate and waste magnitude
+    if hit_rate < 70 and len(sessions) > 5:
+        severity = "high"
+    elif hit_rate < 85 or total_waste > 50000:
+        severity = "medium"
+    else:
+        severity = "low"
+
+    worst_expiry = sorted(expiry_sessions, key=lambda x: -x["expiries"])[:3]
+
+    rec_parts = [
+        "HOW CACHING WORKS: Claude Code automatically caches your system "
+        "prompt, tool definitions, and conversation history. Each cache "
+        "entry expires after 5 minutes of inactivity. A cache hit costs "
+        "0.1x the normal input price (90% discount). When the cache "
+        "expires, the next message repays the 1.25x write cost instead "
+        "of reading at 0.1x. You can't toggle caching -- it's always "
+        "on. What you control is whether your usage patterns let it "
+        "work efficiently.",
+    ]
+    if cache_expiries > 0:
+        rec_parts.append(
+            f"UNDER-USE: {cache_expiries} cache expiries detected (gaps >5 min "
+            f"between messages). This is normal for thinking time, but each "
+            f"expiry forces the API to reprocess ~{fmt(ctx)} tokens of context "
+            f"at 1.25x instead of reading from cache at 0.1x. Batching "
+            f"related questions into fewer, more focused sessions reduces "
+            f"re-write overhead.")
+    if single_turn > 3:
+        rec_parts.append(
+            f"UNDER-USE: {single_turn} single-turn sessions paid the 1.25x "
+            f"cache write premium with zero cache reads to amortize it. "
+            f"Combine quick questions into one session so the write cost "
+            f"is spread across multiple reads at 0.1x.")
+    if consolidatable > 0:
+        rec_parts.append(
+            f"UNDER-USE: {consolidatable} clusters of short sessions within "
+            f"30 min could be consolidated into fewer warm-cache sessions.")
+    if bloat_per_session > 500:
+        rec_parts.append(
+            f"OVER-USE: ~{unused_ctx:,} unused context tokens (from MCP "
+            f"servers/skills you never call) are cached and re-read every "
+            f"message at 0.1x. Caching makes bloat feel cheap -- 0.1x "
+            f"sounds like nothing -- but it adds ~{bloat_per_session:,} "
+            f"effective tokens per session. Removing the unused servers "
+            f"or skills eliminates this cost entirely.")
+
+    return {
+        "id": "cache_efficiency", "name": "Prompt Cache Efficiency",
+        "severity": severity,
+        "hit_rate": hit_rate,
+        "total_potential_reads": total_potential_reads,
+        "total_actual_reads": total_actual_reads,
+        "cache_expiries": cache_expiries,
+        "single_turn_sessions": single_turn,
+        "consolidatable_clusters": consolidatable,
+        "worst_expiry_sessions": worst_expiry,
+        "context_tokens": ctx,
+        "unused_context_tokens": unused_ctx,
+        "bloat_per_session": bloat_per_session,
+        "expiry_waste": expiry_waste,
+        "expiry_missed_savings": expiry_missed,
+        "single_turn_waste": single_waste,
+        "bloat_waste": bloat_total,
+        "est_token_waste": total_waste,
+        "recommendation": " ".join(rec_parts),
+    }
+
+
 def detect_conversational_roundtrips(history, events):
     """Multiple back-and-forth turns before any tool call — clarification waste.
 
@@ -1170,6 +1496,14 @@ def fmt(n):
     return f"{n:,}"
 
 
+def fmt_dollars(tokens, price_per_mtok):
+    """Convert tokens to dollars and format as '(~$X.XX)'."""
+    dollars = tokens * price_per_mtok / 1_000_000
+    if dollars < 0.005:
+        return "(<$0.01)"
+    return f"(~${dollars:,.2f})"
+
+
 def wrap(text, prefix="     >> ", cont="        ", width=68):
     lines = []
     line = prefix
@@ -1230,7 +1564,10 @@ def print_context_audit(ctx):
                        prefix="  >> ", cont="     "))
 
 
-def print_report(findings, trends, tod, mcp, enhanced, period, n_events, n_sessions, context_audit=None):
+def print_report(findings, trends, tod, mcp, enhanced, period, n_events, n_sessions, context_audit=None, pricing=None):
+    price = pricing or MODEL_PRICING["opus"]
+    price_input = price["input"]
+
     print()
     print("=" * 64)
     print("  CLAUDE CODE EFFICIENCY REPORT")
@@ -1238,8 +1575,14 @@ def print_report(findings, trends, tod, mcp, enhanced, period, n_events, n_sessi
     print(f"  Period:      {period}")
     print(f"  Sessions:    {n_sessions}")
     print(f"  Tool calls:  {fmt(n_events)}")
+    print(f"  Model:       {price['label']} (${price['input']}/MTok in, ${price['output']}/MTok out)")
     print(f"  Generated:   {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print("=" * 64)
+    print()
+    print("  NOTE: Dollar estimates are approximations based on input")
+    print(f"  token pricing for {price['label']}. Actual costs depend on")
+    print("  your input/output mix, cache hits, and plan. The real")
+    print("  currency is tokens -- dollars are for reference only.")
 
     total_waste = 0
     actionable = [f for f in findings if f["severity"] != "low"]
@@ -1322,8 +1665,32 @@ def print_report(findings, trends, tod, mcp, enhanced, period, n_events, n_sessi
                 print(f"     Overkill sessions: {f['overkill_sessions']}  |  Excess agents: {f['excess_agents']}")
             elif f["id"] == "conversational_roundtrips":
                 print(f"     Clarification chains: {f['chains']}  |  Total rounds: {f['total_rounds']}")
+            elif f["id"] == "model_selection":
+                t = f["total_classified"]
+                print(f"     Sessions analyzed: {t}")
+                print(f"     Simple  (Haiku-suitable):  {f['simple_sessions']:>3} ({round(f['simple_sessions']/t*100) if t else 0}%)")
+                print(f"     Routine (Sonnet-suitable): {f['routine_sessions']:>3} ({round(f['routine_sessions']/t*100) if t else 0}%)")
+                print(f"     Complex (Opus-justified):  {f['complex_sessions']:>3} ({round(f['complex_sessions']/t*100) if t else 0}%)")
+                if f["total_agents"] > 0:
+                    print(f"     Agents without model hint: {f['agents_without_model']} / {f['total_agents']}")
+                if f.get("actual_models"):
+                    parts = ", ".join(f"{m}: {c}" for m, c in f["actual_models"].items())
+                    print(f"     Actual model usage: {parts}")
+            elif f["id"] == "cache_efficiency":
+                print(f"     UNDER-USE:")
+                print(f"       Estimated cache hit rate: {f['hit_rate']}%")
+                print(f"       Cache expiries (>5min gaps): {f['cache_expiries']}")
+                if f["worst_expiry_sessions"]:
+                    for ws in f["worst_expiry_sessions"]:
+                        print(f"         {ws['session']}... ({ws['expiries']} expiries in {ws['tools']} tools)")
+                print(f"       Single-turn sessions (no reads): {f['single_turn_sessions']}")
+                print(f"       Consolidatable session clusters: {f['consolidatable_clusters']}")
+                if f["unused_context_tokens"] > 0:
+                    print(f"     OVER-USE:")
+                    print(f"       Cached bloat (unused context): ~{fmt(f['unused_context_tokens'])} tokens/msg")
+                    print(f"       Bloat cost (masked by cache): ~{fmt(f['bloat_per_session'])} eff. tokens/session")
 
-            print(f"     Est. token waste: ~{fmt(waste)}")
+            print(f"     Est. token waste: ~{fmt(waste)} {fmt_dollars(waste, price_input)}")
             print(wrap(f["recommendation"]))
 
     if low:
@@ -1335,10 +1702,8 @@ def print_report(findings, trends, tod, mcp, enhanced, period, n_events, n_sessi
 
     print(f"\n{'-' * 64}")
     avg = total_waste // n_sessions if n_sessions else 0
-    print(f"  TOTAL ESTIMATED TOKEN WASTE:     ~{fmt(total_waste)}")
-    print(f"  PER SESSION AVERAGE:             ~{fmt(avg)}")
-    if avg > 5000:
-        print(f"  POTENTIAL SAVINGS:               ~{round(avg / 50000 * 100)}% per session")
+    print(f"  TOTAL ESTIMATED TOKEN WASTE:     ~{fmt(total_waste)} {fmt_dollars(total_waste, price_input)}")
+    print(f"  PER SESSION AVERAGE:             ~{fmt(avg)} {fmt_dollars(avg, price_input)}")
     print(f"{'-' * 64}")
 
     if len(trends) >= 2:
@@ -1385,27 +1750,41 @@ def main():
         description="Claude Code Efficiency Analyzer -- detect wasteful patterns, save tokens",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Examples:\n"
-               "  python cc_efficiency.py              # Last 7 days\n"
+               "  python cc_efficiency.py              # Last 7 days, basic detectors\n"
+               "  python cc_efficiency.py -A            # Full analysis (all time + all features)\n"
                "  python cc_efficiency.py --days 30    # Last 30 days\n"
-               "  python cc_efficiency.py --all        # All time\n"
+               "  python cc_efficiency.py --all-time   # All time, basic detectors\n"
                "  python cc_efficiency.py --json       # JSON output\n",
     )
     parser.add_argument("--days", type=int, default=7, help="Analyze last N days (default: 7)")
-    parser.add_argument("--all", action="store_true", help="Analyze all time")
+    parser.add_argument("--all-time", action="store_true", help="Analyze all historical data")
+    parser.add_argument("--all", action="store_true", dest="all_time",
+                        help="(alias for --all-time)")
+    parser.add_argument("-A", action="store_true", dest="full",
+                        help="Full analysis: all time + deep + context-audit")
     parser.add_argument("--json", action="store_true", help="Output JSON instead of formatted report")
     parser.add_argument("--context-audit", action="store_true",
                         help="Audit context overhead: MCP servers, skills, plugins loaded but unused")
     parser.add_argument("--deep", action="store_true",
                         help="Deep analysis: parse transcripts for compaction, bloat, round-trips")
+    parser.add_argument("--model", type=str, default="opus",
+                        choices=list(MODEL_PRICING.keys()),
+                        help="Model for dollar cost estimates (default: opus)")
     parser.add_argument("--project", type=str, default=None,
                         help="Project directory to scan for .mcp.json and CLAUDE.md (default: CWD)")
     args = parser.parse_args()
+
+    # -A enables everything
+    if args.full:
+        args.all_time = True
+        args.deep = True
+        args.context_audit = True
 
     if args.project:
         import os
         os.chdir(args.project)
 
-    if args.all:
+    if args.all_time:
         since_ts = None
         period = "All time"
     else:
@@ -1427,6 +1806,13 @@ def main():
     enhanced_events = load_jsonl(EFFICIENCY_DB, since_ts)
     n_events = sum(1 for e in events if e.get("type") == "PostToolUse")
     n_sessions = len(sessions)
+
+    # Compute context audit early (cache detector uses it)
+    trends = compute_weekly_trends(events)
+    tod = compute_time_of_day(events)
+    mcp = analyze_mcp_adoption(events)
+    enhanced = analyze_enhanced(EFFICIENCY_DB, since_ts)
+    ctx = audit_context(events, mcp) if args.context_audit else None
 
     # Original 7 detectors
     findings = [
@@ -1450,6 +1836,7 @@ def main():
     ]
 
     # Tier 3 (--deep)
+    transcript_events = None
     if args.deep:
         projects_dir = CLAUDE_DIR / "projects"
         transcript_events = _load_transcript_events(projects_dir, since_ts)
@@ -1460,26 +1847,37 @@ def main():
             detect_conversational_roundtrips(history, events),
         ])
 
+    # Model selection (always-on heuristics, enriched with --deep transcript data)
+    findings.append(detect_model_selection_inefficiency(sessions, transcript_events))
+
+    # Cache efficiency (enriched with --context-audit data when available)
+    findings.append(detect_cache_efficiency(
+        sessions,
+        context_tokens=ctx["total_context_per_msg"] if ctx else None,
+        waste_tokens=ctx["waste_per_msg"] if ctx else None,
+    ))
+
     findings.sort(key=lambda f: ({"high": 0, "medium": 1, "low": 2}[f["severity"]], -f.get("est_token_waste", 0)))
 
-    trends = compute_weekly_trends(events)
-    tod = compute_time_of_day(events)
-    mcp = analyze_mcp_adoption(events)
-    enhanced = analyze_enhanced(EFFICIENCY_DB, since_ts)
-    ctx = audit_context(events, mcp) if args.context_audit else None
-
     if args.json:
+        pricing = MODEL_PRICING[args.model]
+        total_waste = sum(f.get("est_token_waste", 0) for f in findings)
         result = {
             "period": period, "sessions": n_sessions, "total_tool_calls": n_events,
-            "generated": datetime.now().isoformat(), "findings": findings,
+            "generated": datetime.now().isoformat(),
+            "model": pricing["label"],
+            "pricing": pricing,
+            "findings": findings,
             "trends": trends, "peak_hours": tod, "mcp_adoption": mcp, "enhanced": enhanced,
-            "total_est_token_waste": sum(f.get("est_token_waste", 0) for f in findings),
+            "total_est_token_waste": total_waste,
+            "total_est_cost_usd": round(total_waste * pricing["input"] / 1_000_000, 2),
         }
         if ctx:
             result["context_audit"] = ctx
         print(json.dumps(result, indent=2, default=str))
     else:
-        print_report(findings, trends, tod, mcp, enhanced, period, n_events, n_sessions, ctx)
+        print_report(findings, trends, tod, mcp, enhanced, period, n_events, n_sessions, ctx,
+                     pricing=MODEL_PRICING[args.model])
 
 
 if __name__ == "__main__":

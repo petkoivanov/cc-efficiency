@@ -1,6 +1,6 @@
 ---
 name: "efficiency"
-description: "Analyze Claude Code usage efficiency. 19 detectors for wasteful patterns (Bash overuse, search churn, redundant re-reads, edit-without-read, ToolSearch overhead, session thrashing, retry storms, vague prompts, and more). Estimates token waste, tracks weekly trends, audits context overhead, and gives actionable recommendations."
+description: "Analyze Claude Code usage efficiency. 21 detectors for wasteful patterns (Bash overuse, search churn, redundant re-reads, edit-without-read, ToolSearch overhead, session thrashing, retry storms, vague prompts, model selection, cache efficiency, and more). Estimates token waste, tracks weekly trends, audits context overhead, and gives actionable recommendations."
 ---
 
 # Claude Code Efficiency Report
@@ -12,23 +12,19 @@ Run the efficiency analyzer to detect wasteful patterns in your Claude Code usag
 1. Run the analyzer script:
 
 ```bash
-python ~/.claude/tools/cc_efficiency.py --all --context-audit
+python ~/.claude/tools/cc_efficiency.py -A
 ```
 
-Or for recent data only:
+This runs the full analysis: all historical data + deep transcript parsing + context audit.
+
+Or for a quick recent check:
 
 ```bash
 python ~/.claude/tools/cc_efficiency.py --days 7
 ```
 
-For deep analysis (parses transcripts):
-
-```bash
-python ~/.claude/tools/cc_efficiency.py --all --deep --project /path/to/project
-```
-
 2. Review the findings with the user. For each HIGH or MEDIUM finding, explain:
-   - What the pattern is and why it wastes tokens
+   - What the pattern is and why it wastes tokens (and dollars)
    - The concrete recommendation
    - Whether a CLAUDE.md rule would help
 
@@ -40,14 +36,16 @@ python ~/.claude/tools/cc_efficiency.py --all --deep --project /path/to/project
 
 ## Options
 
-- `--all` -- analyze all historical data
+- `-A` -- full analysis (all time + deep + context-audit)
+- `--all-time` -- analyze all historical data (also `--all`)
 - `--days N` -- analyze last N days (default: 7)
-- `--json` -- machine-readable output for further processing
-- `--context-audit` -- audit MCP servers, skills, plugins loaded but unused
 - `--deep` -- parse transcripts for compaction, bloat, round-trips
+- `--context-audit` -- audit MCP servers, skills, plugins loaded but unused
+- `--model MODEL` -- model for dollar estimates: opus, sonnet, haiku (default: opus)
+- `--json` -- machine-readable output for further processing
 - `--project PATH` -- scan a specific project for .mcp.json and CLAUDE.md
 
-## What It Detects (19 Patterns)
+## What It Detects (21 Patterns)
 
 | # | Pattern | Token Cost |
 |---|---------|------------|
@@ -70,3 +68,5 @@ python ~/.claude/tools/cc_efficiency.py --all --deep --project /path/to/project
 | 17 | CLAUDE.md Bloat (--deep) | cache overhead |
 | 18 | Subagent Overkill (--deep) | ~8,000/excess |
 | 19 | Conversational Round-Trips (--deep) | ~5,000/round |
+| 20 | Model Selection Inefficiency | ~2-3K/session |
+| 21 | Prompt Cache Efficiency | ~11.5K/expiry |

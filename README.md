@@ -8,11 +8,12 @@ Zero dependencies -- Python 3.8+ stdlib only.
 
 ## What it does
 
-- **19 anti-pattern detectors** across tool usage, session behavior, prompts, and context overhead
-- **Token waste estimates** with conservative per-call heuristics
+- **21 anti-pattern detectors** across tool usage, session behavior, prompts, model selection, cache efficiency, and context overhead
+- **Token waste estimates** with conservative per-call heuristics and dollar approximations
 - **Weekly trends** to track if you're improving
 - **Context audit** of MCP servers, skills, and plugins loaded but never used
 - **Deep mode** that parses transcripts for compaction amnesia, subagent overkill, and round-trip waste
+- **Educational output** that explains *why* each pattern costs money (prompt caching, model pricing, context overhead)
 
 ## What it doesn't do
 
@@ -57,23 +58,23 @@ Add this to `~/.claude/settings.json`. The enriched hook captures tool names, fi
 ### 2. Run the analyzer
 
 ```bash
+# Full analysis (all time + deep + context audit) -- recommended
+python cc_efficiency.py -A
+
 # Last 7 days (default)
 python cc_efficiency.py
 
 # Last 30 days
 python cc_efficiency.py --days 30
 
-# All time
-python cc_efficiency.py --all
+# All time, basic detectors
+python cc_efficiency.py --all-time
 
-# Full report with context audit
-python cc_efficiency.py --all --context-audit --project /path/to/your/project
-
-# Deep analysis (parses transcripts -- slower)
-python cc_efficiency.py --all --deep
+# Dollar estimates for a different model
+python cc_efficiency.py -A --model sonnet
 
 # Machine-readable JSON
-python cc_efficiency.py --all --json --context-audit
+python cc_efficiency.py -A --json
 ```
 
 ### 3. Read the report
@@ -83,51 +84,47 @@ python cc_efficiency.py --all --json --context-audit
   CLAUDE CODE EFFICIENCY REPORT
 ================================================================
   Period:      All time
-  Sessions:    54
-  Tool calls:  10,006
+  Sessions:    55
+  Tool calls:  10,403
+  Model:       Opus 4.6 ($5.0/MTok in, $25.0/MTok out)
+================================================================
+
+  NOTE: Dollar estimates are approximations based on input
+  token pricing for Opus 4.6. Actual costs depend on
+  your input/output mix, cache hits, and plan. The real
+  currency is tokens -- dollars are for reference only.
 
 FINDINGS
 ----------------------------------------------------------------
 
   1. [!!] Search Churn (Floundering)  (HIGH)
      ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-     Churn loops: 162  |  Wasted calls: 1,690
-     Est. token waste: ~194,400
-     >>  When you can't find something in 2 searches, use the
-        Explore agent or ask Claude to search more broadly.
+     Churn loops: 168  |  Wasted calls: 1,740
+     Est. token waste: ~201,600 (~$1.01)
 
-  2. [!!] ToolSearch Overhead  (HIGH)
+  2. [! ] Prompt Cache Efficiency  (MEDIUM)
      ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-     ToolSearch calls: 190 (1.9% of all tools)
-     Est. token waste: ~66,500
-     >>  Add frequently-used MCP tools to permissions.allow
-        in settings.json so schemas load upfront.
+     UNDER-USE:
+       Estimated cache hit rate: 97.1%
+       Cache expiries (>5min gaps): 296
+     OVER-USE:
+       Cached bloat (unused context): ~3,033 tokens/msg
+     Est. token waste: ~1,816,762 (~$9.08)
 
   3. [! ] Bash Overuse  (MEDIUM)
      ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-     Bash calls: 2,459 / 10,006 (24.6%)
-     Healthy range: 10-15%
-     Est. token waste: ~383,600
-     >>  Use Grep instead of grep/rg. Use Read instead of
-        cat/head/tail. Use Glob instead of find/ls.
+     Bash calls: 2,589 / 10,403 (24.9%)
+     Est. token waste: ~411,600 (~$2.06)
 
-  4. [! ] Edit Without Prior Read  (MEDIUM)
-     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-     Edit-before-read failures: 97
-     Est. token waste: ~145,500
-     >>  Claude sometimes tries to edit a file it hasn't
-        read, fails, then reads and retries.
-
-  + 8 low-severity patterns (no action needed)
+  + 12 low-severity patterns (no action needed)
 
 ----------------------------------------------------------------
-  TOTAL ESTIMATED TOKEN WASTE:     ~970,400
-  PER SESSION AVERAGE:             ~17,677
-  POTENTIAL SAVINGS:               ~35% per session
+  TOTAL ESTIMATED TOKEN WASTE:     ~2,924,917 (~$14.62)
+  PER SESSION AVERAGE:             ~53,180 (~$0.27)
 ----------------------------------------------------------------
 ```
 
-## What It Detects (19 Patterns)
+## What It Detects (21 Patterns)
 
 ### Core Patterns (always run)
 
@@ -158,6 +155,13 @@ FINDINGS
 | 13 | **Repeated Discovery** | Same Grep/Glob pattern in 3+ sessions | ~1,000/repeat | Add key paths to CLAUDE.md |
 | 14 | **Edit Without Read** | Edit fails -> Read -> Edit retry | ~1,500/failure | Always Read before Edit |
 | 15 | **Permission Friction** | Same tool denied 3+ times | ~1,500/denial | Auto-allow in settings.json |
+
+### Cost & Caching (always run)
+
+| # | Pattern | Signal | Token Cost | Fix |
+|---|---------|--------|------------|-----|
+| 20 | **Model Selection** | Opus used for simple/routine tasks | ~2-3K/session | Use /model; set model on Agent spawns |
+| 21 | **Cache Efficiency** | >5min gaps expire prompt cache | ~11.5K/expiry | Batch questions; reduce context bloat |
 
 ### Tier 3 -- Deep Analysis (`--deep` flag)
 
@@ -210,7 +214,7 @@ WEEKLY TRENDS
 
 ## Enhanced Hooks (Recommended)
 
-For the full 19-pattern analysis, add error, denial, and session tracking hooks. See [`hooks.json`](hooks.json) for the complete config. This enables:
+For the full 21-pattern analysis, add error, denial, and session tracking hooks. See [`hooks.json`](hooks.json) for the complete config. This enables:
 
 - **PostToolUseFailure** -- retry storm detection, edit-without-read failures
 - **PermissionDenied** -- permission friction analysis
@@ -259,21 +263,59 @@ cp cc_efficiency.py ~/.claude/tools/
 
 1. The PostToolUse hook writes one JSON line per tool call to `~/.claude/.dashboard-events.jsonl`
 2. Each line: `{"type": "PostToolUse", "tool": "Read", "sessionId": "abc-123", "timestamp": 1713000000000, "file": "/path/to/file.py"}`
-3. The analyzer reads this file, groups events by session, and runs 19 pattern detectors
+3. The analyzer reads this file, groups events by session, and runs 21 pattern detectors
 4. Token waste estimates use conservative per-call heuristics (see `TOKEN_COSTS` in source)
 5. `--deep` mode additionally parses transcript JSONL files from `~/.claude/projects/` for structural analysis (compaction events, round-trips) without reading message content
 6. All data stays local -- nothing is sent anywhere
 
-## Comparison with Existing Tools
+## How It Compares
 
-| Tool | Focus | Data Source |
-|------|-------|-------------|
-| `/insights` (built-in) | Qualitative AI analysis | Full transcripts |
-| `/stats` (built-in) | Activity grid, streaks | Session metadata |
-| `ccusage` (12.8K stars) | Cost tracking, token counts | Session JSONL |
-| **cc-efficiency** | **Waste pattern detection + fixes** | **Tool event stream** |
+There are many tools in the token efficiency space. They operate at different layers and answer different questions:
 
-`ccusage` tells you "you spent $X". `cc-efficiency` tells you "you wasted 35% on search churn and edit retries -- here's how to fix each one."
+```
+Layer 3: PREVENT waste    ->  Output compression (RTK, etc.)
+Layer 2: DETECT waste     ->  Behavioral analysis (cc-efficiency)
+Layer 1: TRACK spend      ->  Cost dashboards (ccusage, toktrack, etc.)
+```
+
+- **Layer 1** answers: "How much did I spend?"
+- **Layer 2** answers: "Where did I waste tokens, and why?"
+- **Layer 3** answers: "Can I get the same result with fewer tokens?"
+
+| | **RTK** | **cc-efficiency** | **toktrack / splitrail** | **claude-dashboard** |
+|---|---|---|---|---|
+| **Approach** | Prevent waste (compress output before AI sees it) | Detect waste (analyze patterns after the fact) | Track spend (real-time cost monitoring) | Track spend (statusline display) |
+| **When it acts** | During execution (PreToolUse hook) | After sessions (post-hoc analysis) | During execution (real-time) | During execution (real-time) |
+| **What it measures** | Tokens saved per command | Tokens wasted per pattern | Tokens/dollars spent | Tokens/dollars spent |
+| **Scope** | Bash command output only | All tool usage, caching, model selection, context | All tokens | All tokens |
+| **Language** | Rust | Python (stdlib only) | Rust | TypeScript |
+| **Stars** | 26.6K | New | 82-156 | 356-422 |
+| **Detectors/Filters** | 100+ command filters | 21 behavioral detectors | N/A | N/A |
+| **Model awareness** | No | Yes (model selection, cache efficiency) | No | Some |
+| **Actionable output** | Automatic (transparent compression) | Recommendations + education | Informational (dashboards) | Informational (statusline) |
+
+### What RTK does that cc-efficiency doesn't
+
+- **Active prevention** -- savings happen automatically without user behavior change
+- **Per-command compression** -- deep knowledge of 100+ shell command output formats
+- **Transparent** -- the AI doesn't know it's running
+
+### What cc-efficiency does that RTK doesn't
+
+- **Behavioral analysis** -- detects anti-patterns across sessions (search churn, vague prompts, retry storms, session thrashing)
+- **Model selection analysis** -- flags when Opus is used for Haiku-level tasks
+- **Cache efficiency** -- analyzes whether prompt caching is working for or against you
+- **Cost education** -- explains *why* things cost what they do, with dollar estimates grounded in actual usage
+- **Context audit** -- identifies unused MCP servers/skills inflating every message
+- **Scope** -- analyzes all tool usage (Read, Edit, Agent, Grep), not just Bash output
+
+### Using them together
+
+RTK and cc-efficiency are complementary. RTK compresses what goes in (Layer 3); cc-efficiency finds patterns that shouldn't happen at all (Layer 2). A cost tracker (Layer 1) shows the dollar impact. The ideal setup uses all three layers.
+
+However, RTK only affects Bash output -- Read, Grep, Edit, Agent, and prompt cache costs are unchanged. In a typical session where Bash is 15-25% of tool calls, RTK's impact is real but bounded.
+
+See [docs/companion-tools.md](docs/companion-tools.md) for a detailed review of RTK including pros, cons, and security considerations before installing.
 
 ## License
 
