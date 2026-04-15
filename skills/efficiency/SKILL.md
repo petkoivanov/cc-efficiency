@@ -28,7 +28,13 @@ python ~/.claude/tools/cc_efficiency.py --days 7
    - The concrete recommendation
    - Whether a CLAUDE.md rule would help
 
-3. If the user wants to act on recommendations, help them:
+3. **Always include the educational sections** regardless of severity. This tool's primary goal is to help users understand costs:
+   - **Prompt Cache Efficiency**: Always explain how Claude Code's automatic prompt caching works (5-min TTL, 0.1x reads vs 1.25x writes), what the user's cache hit rate means, and what under-use/over-use look like. Even a 97% hit rate has a story worth telling.
+   - **Model Selection**: Always explain the cost difference between Opus/Sonnet/Haiku, that output tokens are never cached and cost 5x input, and what the session complexity breakdown shows. Even if the user's sessions justify Opus, explain why.
+   - **Dollar estimates**: Point out the model pricing shown in the header and explain what the per-session average means in practical terms.
+   - **Context overhead**: If --context-audit ran, explain what MCP servers/skills/plugins cost per message and why unused ones matter even when cached.
+
+4. If the user wants to act on recommendations, help them:
    - Add rules to CLAUDE.md (e.g., "Do not re-read files after editing")
    - Update settings.json permissions (e.g., add `mcp__*` to allow list)
    - Remove unused MCP servers from .mcp.json
