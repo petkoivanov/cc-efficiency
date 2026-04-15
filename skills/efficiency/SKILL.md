@@ -28,23 +28,11 @@ python ~/.claude/tools/cc_efficiency.py --days 7
    - The concrete recommendation
    - Whether a CLAUDE.md rule would help
 
-3. **Always include educational sections** regardless of severity. This tool's primary goal is to help users understand costs. Present each educational section as a **collapsible `<details>` block** so new users can expand them to learn while experienced users see a clean report.
-
-   Format each section like this:
-   ```markdown
-   <details>
-   <summary>How prompt caching affects your costs (click to expand)</summary>
-
-   ...explanation...
-
-   </details>
-   ```
-
-   Include these educational sections:
-   - **Prompt Cache Efficiency**: How Claude Code's automatic prompt caching works (5-min TTL, 0.1x reads vs 1.25x writes), what the user's cache hit rate means, and what under-use/over-use look like. Even a 97% hit rate has a story worth telling.
-   - **Model Selection**: The cost difference between Opus/Sonnet/Haiku, that output tokens are never cached and cost 5x input, and what the session complexity breakdown shows. Even if the user's sessions justify Opus, explain why.
-   - **Dollar estimates**: What the model pricing in the header means and what the per-session average means in practical terms.
-   - **Context overhead**: If --context-audit ran, what MCP servers/skills/plugins cost per message and why unused ones matter even when cached.
+3. **Always include an "Understanding Your Costs" section** at the end of the report, regardless of finding severity. This tool's primary goal is education. Use a markdown heading and keep each topic to 2-3 sentences. Cover:
+   - **Prompt caching**: How Claude Code's automatic caching works (5-min TTL, 0.1x reads vs 1.25x writes), what the user's hit rate means, what expiries cost.
+   - **Model pricing**: The cost difference between Opus/Sonnet/Haiku, that output tokens are never cached and cost 5x input, what the session complexity breakdown shows.
+   - **Context overhead**: If --context-audit ran, what MCP servers/skills/plugins cost per message and why unused ones still cost even when cached.
+   - **How to read the dollar estimates**: These use the input token price as a baseline. Output-heavy waste (code generation, agent spawns) costs more. The real currency is tokens; dollars are for reference.
 
 4. If the user wants to act on recommendations, help them:
    - Add rules to CLAUDE.md (e.g., "Do not re-read files after editing")
