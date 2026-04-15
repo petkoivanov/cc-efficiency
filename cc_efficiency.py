@@ -1765,14 +1765,20 @@ def main():
     parser.add_argument("--json", action="store_true", help="Output JSON instead of formatted report")
     parser.add_argument("--context-audit", action="store_true",
                         help="Audit context overhead: MCP servers, skills, plugins loaded but unused")
-    parser.add_argument("--deep", action="store_true",
-                        help="Deep analysis: parse transcripts for compaction, bloat, round-trips")
+    parser.add_argument("--deep", action="store_true", default=True,
+                        help="Deep analysis: parse transcripts (default: on, use --no-deep to skip)")
+    parser.add_argument("--no-deep", action="store_true",
+                        help="Skip deep transcript analysis for faster results")
     parser.add_argument("--model", type=str, default="opus",
                         choices=list(MODEL_PRICING.keys()),
                         help="Model for dollar cost estimates (default: opus)")
     parser.add_argument("--project", type=str, default=None,
                         help="Project directory to scan for .mcp.json and CLAUDE.md (default: CWD)")
     args = parser.parse_args()
+
+    # --no-deep overrides default
+    if args.no_deep:
+        args.deep = False
 
     # -A enables everything
     if args.full:
