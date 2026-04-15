@@ -4,7 +4,7 @@ Detects wasteful patterns in your Claude Code usage, estimates token overhead, a
 
 Zero dependencies -- Python 3.8+ stdlib only.
 
-![Example report showing findings, severity levels, and token waste estimates](docs/report-example.png)
+![Example report showing findings with dollar estimates, cache efficiency, context overhead, and educational cost breakdown](docs/report-example.png)
 
 ## What it does
 
