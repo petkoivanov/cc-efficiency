@@ -18,6 +18,9 @@ Usage:
 import json
 import sys
 import argparse
+import subprocess
+import time
+import urllib.request
 from datetime import datetime, timedelta
 from collections import defaultdict, Counter
 from pathlib import Path
@@ -53,8 +56,24 @@ CACHE_WRITE_MULTIPLIER = 1.25      # 5-min cache write = 1.25x base input
 CACHE_READ_MULTIPLIER = 0.1        # cache hit = 0.1x base input
 DEFAULT_CONTEXT_TOKENS = 10_000    # fallback when no --context-audit
 
-# Model pricing ($ per million tokens)
-MODEL_PRICING = {
+# Live pricing — fetched from LiteLLM's published JSON and cached for 1 day.
+# Falls back to stale cache → hardcoded fallback if the network is unavailable.
+LITELLM_PRICING_URL = (
+    "https://raw.githubusercontent.com/BerriAI/litellm/main/"
+    "model_prices_and_context_window.json"
+)
+LITELLM_CACHE_PATH = Path.home() / ".claude" / "tools" / ".litellm_pricing_cache.json"
+LITELLM_CACHE_TTL_S = 86_400  # 1 day
+
+# Map the skill's short names to LiteLLM keys.
+LITELLM_KEY_MAP = {
+    "opus":   "claude-opus-4-7",
+    "sonnet": "claude-sonnet-4-6",
+    "haiku":  "claude-haiku-4-5",
+}
+
+# Hardcoded fallback — used only when the fetch fails AND the cache is absent.
+MODEL_PRICING_FALLBACK = {
     "opus": {"label": "Opus 4.6", "input": 5.0, "output": 25.0,
              "cache_read": 0.50, "cache_write": 6.25},
     "sonnet": {"label": "Sonnet 4.6", "input": 3.0, "output": 15.0,
@@ -62,6 +81,74 @@ MODEL_PRICING = {
     "haiku": {"label": "Haiku 4.5", "input": 1.0, "output": 5.0,
               "cache_read": 0.10, "cache_write": 1.25},
 }
+
+
+def _parse_litellm_pricing(raw):
+    """Parse LiteLLM JSON into MODEL_PRICING-shaped dict. Returns {} on failure."""
+    pricing = {}
+    for short, litellm_key in LITELLM_KEY_MAP.items():
+        entry = raw.get(litellm_key) or raw.get(f"anthropic/{litellm_key}")
+        if not entry:
+            print(f"  [pricing] Warning: LiteLLM key not found for '{short}' "
+                  f"(tried '{litellm_key}'). Using fallback.", file=sys.stderr)
+            continue
+        inp = entry.get("input_cost_per_token", 0) * 1_000_000
+        out = entry.get("output_cost_per_token", 0) * 1_000_000
+        cr = entry.get("cache_read_input_token_cost", 0) * 1_000_000
+        cw = entry.get("cache_creation_input_token_cost", 0) * 1_000_000
+        label = (entry.get("display_name")
+                 or MODEL_PRICING_FALLBACK.get(short, {}).get("label")
+                 or short.capitalize())
+        pricing[short] = {
+            "label": label, "input": inp, "output": out,
+            "cache_read": cr, "cache_write": cw,
+        }
+    return pricing
+
+
+def load_pricing(force_refresh=False):
+    """Return MODEL_PRICING-shaped dict. Strategy: cache → fetch → stale-cache → fallback."""
+    # 1. Fresh cache (within TTL, unless force-refresh)
+    if not force_refresh and LITELLM_CACHE_PATH.exists():
+        age = time.time() - LITELLM_CACHE_PATH.stat().st_mtime
+        if age < LITELLM_CACHE_TTL_S:
+            try:
+                data = json.loads(LITELLM_CACHE_PATH.read_text())
+                if len(data) == 3:
+                    return data
+            except (json.JSONDecodeError, OSError):
+                pass  # corrupt cache → refetch
+
+    # 2. Attempt live fetch
+    try:
+        with urllib.request.urlopen(LITELLM_PRICING_URL, timeout=5) as resp:
+            raw = json.loads(resp.read())
+        pricing = _parse_litellm_pricing(raw)
+        if len(pricing) == 3:  # all three keys resolved — safe to cache
+            try:
+                LITELLM_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+                LITELLM_CACHE_PATH.write_text(json.dumps(pricing, indent=2))
+            except OSError:
+                pass  # cache write failure is non-fatal
+            return pricing
+    except Exception:
+        pass  # network error, timeout, JSON parse failure — fall through
+
+    # 3. Stale-cache grace: prefer stale data over hardcoded fallback
+    if LITELLM_CACHE_PATH.exists():
+        try:
+            data = json.loads(LITELLM_CACHE_PATH.read_text())
+            if len(data) == 3:
+                return data
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # 4. Hardcoded fallback
+    return MODEL_PRICING_FALLBACK
+
+
+# Populated in main() via load_pricing(); used as the default for --model choices.
+MODEL_PRICING = MODEL_PRICING_FALLBACK
 
 # Context cost heuristics (tokens per item loaded into system prompt)
 CONTEXT_COSTS = {
@@ -76,7 +163,7 @@ def load_jsonl(path, since_ts=None):
     items = []
     if not path.exists():
         return items
-    with open(path) as f:
+    with open(path, encoding="utf-8", errors="ignore") as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -1486,6 +1573,144 @@ def audit_context(events, mcp_usage):
     }
 
 
+# ── Yield Detector (detector #22) ────────────────────────
+
+# Average tokens consumed per tool call (conservative estimate matching the
+# heuristic used in cache_efficiency: ~10K context * 3 calls per API round).
+_TOKENS_PER_TOOL_CALL = 3_300   # ~10K ctx / 3 calls
+
+
+def _session_tokens(events_list):
+    """Estimate tokens consumed by a session from its tool-call count."""
+    return len(events_list) * _TOKENS_PER_TOOL_CALL
+
+
+def _git_commits_in_window(repo_dir, start_ts, end_ts):
+    """Return list of [sha, subject] for commits within [start_ts, end_ts].
+
+    start_ts / end_ts are Unix timestamps (seconds, not ms).
+    Returns an empty list on any error (git not found, timeout, non-zero exit).
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_dir), "log",
+             f"--since={int(start_ts)}", f"--until={int(end_ts)}",
+             "--format=%H %s"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            return []
+        return [line.split(" ", 1) for line in result.stdout.strip().split("\n") if line]
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return []
+
+
+def _cwd_for_session(sid, enhanced_events):
+    """Return the working directory for a session from enhanced SessionStart events."""
+    for e in enhanced_events:
+        if e.get("event") == "SessionStart" and e.get("sessionId") == sid:
+            return e.get("cwd")
+    return None
+
+
+def detect_yield(sessions, enhanced_events):
+    """Correlate sessions with git commits to surface unproductive sessions.
+
+    For each session that ran inside a git repo, runs git log over the
+    session's time window and computes:
+      - commits_in_window   number of commits attributed to this session
+      - tokens              estimated token cost (tool_calls * heuristic)
+      - unproductive        True when tokens > 50K AND commits == 0
+
+    Aggregates into:
+      - total tokens / total commits → tokens_per_commit (lower is better)
+      - list of up to 5 worst unproductive sessions
+
+    Requires the enhanced SessionStart hook to capture 'cwd'. Sessions
+    without a known cwd are silently skipped.
+    """
+    per_session = []
+    total_tokens = 0
+    total_commits = 0
+
+    for sid, events_list in sessions.items():
+        if not events_list:
+            continue
+
+        # Try to get cwd from enhanced SessionStart events
+        cwd = _cwd_for_session(sid, enhanced_events)
+        if not cwd:
+            # Fallback: look for a file path in any event and use its parent tree
+            for e in events_list:
+                fp = e.get("file") or e.get("cmd", "")
+                if fp and Path(fp).exists():
+                    for parent in [Path(fp).parent] + list(Path(fp).parents):
+                        if (parent / ".git").exists():
+                            cwd = str(parent)
+                            break
+                if cwd:
+                    break
+
+        if not cwd or not (Path(cwd) / ".git").exists():
+            continue  # not a git repo — skip
+
+        # Session time window (ms → s for git, +1h grace on end)
+        start_ms = events_list[0].get("timestamp", 0)
+        end_ms = events_list[-1].get("timestamp", 0)
+        start_s = start_ms / 1000
+        end_s = end_ms / 1000 + 3600  # +1 hour grace
+
+        tokens = _session_tokens(events_list)
+        commits = _git_commits_in_window(cwd, start_s, end_s)
+
+        unproductive = tokens > 50_000 and len(commits) == 0
+
+        per_session.append({
+            "session": sid[:8],
+            "cwd": cwd,
+            "tokens": tokens,
+            "commits": len(commits),
+            "unproductive": unproductive,
+        })
+        total_tokens += tokens
+        total_commits += len(commits)
+
+    unproductive_list = [s for s in per_session if s["unproductive"]]
+    tokens_per_commit = (
+        total_tokens / total_commits if total_commits > 0 else float("inf")
+    )
+
+    findings = []
+    if unproductive_list:
+        tokens_wasted = sum(s["tokens"] for s in unproductive_list)
+        findings.append({
+            "id": "yield_unproductive",
+            "name": "Unproductive Sessions (no commits)",
+            "severity": "high" if len(unproductive_list) >= 3 else "medium",
+            "count": len(unproductive_list),
+            "tokens_wasted": tokens_wasted,
+            "details": unproductive_list[:5],
+            "est_token_waste": tokens_wasted,
+            "recommendation": (
+                "Sessions that spend >50K tokens without shipping any git commits "
+                "often signal scope creep, stuck debugging, or exploratory work that "
+                "never converged. Consider: (1) writing a plan before a long session, "
+                "(2) breaking large tasks into smaller shippable slices, "
+                "(3) using --no-deep or a lighter model for pure exploration."
+            ),
+        })
+
+    summary = {
+        "sessions_analyzed": len(per_session),
+        "total_tokens": total_tokens,
+        "total_commits": total_commits,
+        "tokens_per_commit": round(tokens_per_commit) if total_commits > 0 else None,
+        "unproductive_count": len(unproductive_list),
+    }
+
+    return findings, summary
+
+
 # ── Report ────────────────────────────────────────────────
 
 SEVERITY_ICON = {"high": "[!!]", "medium": "[! ]", "low": "[  ]"}
@@ -1564,8 +1789,8 @@ def print_context_audit(ctx):
                        prefix="  >> ", cont="     "))
 
 
-def print_report(findings, trends, tod, mcp, enhanced, period, n_events, n_sessions, context_audit=None, pricing=None):
-    price = pricing or MODEL_PRICING["opus"]
+def print_report(findings, trends, tod, mcp, enhanced, period, n_events, n_sessions, context_audit=None, pricing=None, yield_summary=None):
+    price = pricing or MODEL_PRICING_FALLBACK["opus"]
     price_input = price["input"]
 
     print()
@@ -1676,6 +1901,12 @@ def print_report(findings, trends, tod, mcp, enhanced, period, n_events, n_sessi
                 if f.get("actual_models"):
                     parts = ", ".join(f"{m}: {c}" for m, c in f["actual_models"].items())
                     print(f"     Actual model usage: {parts}")
+            # Yield detector (#22)
+            elif f["id"] == "yield_unproductive":
+                print(f"     Unproductive sessions: {f['count']}  (>50K tokens, 0 commits)")
+                for s in f.get("details", [])[:3]:
+                    proj = Path(s["cwd"]).name if s.get("cwd") else "?"
+                    print(f"     {s['session']}... | {proj} | ~{fmt(s['tokens'])} tokens")
             elif f["id"] == "cache_efficiency":
                 print(f"     UNDER-USE:")
                 print(f"       Estimated cache hit rate: {f['hit_rate']}%")
@@ -1742,6 +1973,30 @@ def print_report(findings, trends, tod, mcp, enhanced, period, n_events, n_sessi
     if context_audit:
         print_context_audit(context_audit)
 
+    if yield_summary:
+        print("\nYIELD ANALYSIS (git correlation)")
+        print("-" * 64)
+        ns = yield_summary["sessions_analyzed"]
+        tc = yield_summary["total_commits"]
+        tt = yield_summary["total_tokens"]
+        tpc = yield_summary["tokens_per_commit"]
+        up = yield_summary["unproductive_count"]
+        print(f"  Sessions with git repo:  {ns}")
+        print(f"  Commits in window:       {tc}")
+        print(f"  Estimated tokens spent:  {fmt(tt)}")
+        if tpc is not None:
+            print(f"  Tokens per commit:       {fmt(tpc)}  (lower is better)")
+        else:
+            print(f"  Tokens per commit:       n/a (no commits in window)")
+        if up > 0:
+            print(f"  Unproductive sessions:   {up}  (>50K tokens, 0 commits)")
+        else:
+            print(f"  Unproductive sessions:   0")
+        if ns == 0:
+            print()
+            print("  No git repos detected. Install the enhanced SessionStart hook")
+            print("  (hooks.json) so cwd is captured per session.")
+
     print(f"\n{'=' * 64}\n")
 
 
@@ -1754,14 +2009,16 @@ def main():
                "  python cc_efficiency.py -A            # Full analysis (all time + all features)\n"
                "  python cc_efficiency.py --days 30    # Last 30 days\n"
                "  python cc_efficiency.py --all-time   # All time, basic detectors\n"
-               "  python cc_efficiency.py --json       # JSON output\n",
+               "  python cc_efficiency.py --json       # JSON output\n"
+               "  python cc_efficiency.py --refresh-pricing  # Force-refresh LiteLLM pricing cache\n"
+               "  python cc_efficiency.py --yield      # Include git-yield correlation analysis\n",
     )
     parser.add_argument("--days", type=int, default=7, help="Analyze last N days (default: 7)")
     parser.add_argument("--all-time", action="store_true", help="Analyze all historical data")
     parser.add_argument("--all", action="store_true", dest="all_time",
                         help="(alias for --all-time)")
     parser.add_argument("-A", action="store_true", dest="full",
-                        help="Full analysis: all time + deep + context-audit")
+                        help="Full analysis: all time + deep + context-audit + yield")
     parser.add_argument("--json", action="store_true", help="Output JSON instead of formatted report")
     parser.add_argument("--context-audit", action="store_true",
                         help="Audit context overhead: MCP servers, skills, plugins loaded but unused")
@@ -1770,11 +2027,18 @@ def main():
     parser.add_argument("--no-deep", action="store_true",
                         help="Skip deep transcript analysis for faster results")
     parser.add_argument("--model", type=str, default="opus",
-                        choices=list(MODEL_PRICING.keys()),
+                        choices=list(MODEL_PRICING_FALLBACK.keys()),
                         help="Model for dollar cost estimates (default: opus)")
     parser.add_argument("--project", type=str, default=None,
                         help="Project directory to scan for .mcp.json and CLAUDE.md (default: CWD)")
+    parser.add_argument("--refresh-pricing", action="store_true",
+                        help="Force-refresh LiteLLM pricing cache (ignores 1-day TTL)")
+    parser.add_argument("--yield", action="store_true", dest="yield_analysis",
+                        help="Correlate sessions with git commits to surface unproductive sessions")
     args = parser.parse_args()
+
+    # Load live pricing first (needed for dollar estimates throughout)
+    pricing = load_pricing(force_refresh=args.refresh_pricing)
 
     # --no-deep overrides default
     if args.no_deep:
@@ -1785,6 +2049,7 @@ def main():
         args.all_time = True
         args.deep = True
         args.context_audit = True
+        args.yield_analysis = True
 
     if args.project:
         import os
@@ -1863,27 +2128,36 @@ def main():
         waste_tokens=ctx["waste_per_msg"] if ctx else None,
     ))
 
+    # Yield analysis (--yield or -A)
+    yield_summary = None
+    if args.yield_analysis:
+        yield_findings, yield_summary = detect_yield(sessions, enhanced_events)
+        findings.extend(yield_findings)
+
     findings.sort(key=lambda f: ({"high": 0, "medium": 1, "low": 2}[f["severity"]], -f.get("est_token_waste", 0)))
 
+    selected_pricing = pricing.get(args.model) or pricing.get("opus") or list(pricing.values())[0]
+
     if args.json:
-        pricing = MODEL_PRICING[args.model]
         total_waste = sum(f.get("est_token_waste", 0) for f in findings)
         result = {
             "period": period, "sessions": n_sessions, "total_tool_calls": n_events,
             "generated": datetime.now().isoformat(),
-            "model": pricing["label"],
-            "pricing": pricing,
+            "model": selected_pricing["label"],
+            "pricing": selected_pricing,
             "findings": findings,
             "trends": trends, "peak_hours": tod, "mcp_adoption": mcp, "enhanced": enhanced,
             "total_est_token_waste": total_waste,
-            "total_est_cost_usd": round(total_waste * pricing["input"] / 1_000_000, 2),
+            "total_est_cost_usd": round(total_waste * selected_pricing["input"] / 1_000_000, 2),
         }
         if ctx:
             result["context_audit"] = ctx
+        if yield_summary:
+            result["yield_analysis"] = yield_summary
         print(json.dumps(result, indent=2, default=str))
     else:
         print_report(findings, trends, tod, mcp, enhanced, period, n_events, n_sessions, ctx,
-                     pricing=MODEL_PRICING[args.model])
+                     pricing=selected_pricing, yield_summary=yield_summary)
 
 
 if __name__ == "__main__":

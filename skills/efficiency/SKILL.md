@@ -1,6 +1,6 @@
 ---
 name: "efficiency"
-description: "Analyze Claude Code usage efficiency. 21 detectors for wasteful patterns (Bash overuse, search churn, redundant re-reads, edit-without-read, ToolSearch overhead, session thrashing, retry storms, vague prompts, model selection, cache efficiency, and more). Estimates token waste, tracks weekly trends, audits context overhead, and gives actionable recommendations."
+description: "Analyze Claude Code usage efficiency. 22 detectors for wasteful patterns (Bash overuse, search churn, redundant re-reads, edit-without-read, ToolSearch overhead, session thrashing, retry storms, vague prompts, model selection, cache efficiency, git-yield correlation, and more). Live pricing from LiteLLM (1-day cache). Estimates token waste, tracks weekly trends, audits context overhead, and gives actionable recommendations."
 ---
 
 # Claude Code Efficiency Report
@@ -42,7 +42,7 @@ python ~/.claude/tools/cc_efficiency.py --days 7
 
 ## Options
 
-- `-A` -- full analysis (all time + deep + context-audit)
+- `-A` -- full analysis (all time + deep + context-audit + yield)
 - `--all-time` -- analyze all historical data (also `--all`)
 - `--days N` -- analyze last N days (default: 7)
 - `--deep` -- parse transcripts for compaction, bloat, round-trips
@@ -50,8 +50,10 @@ python ~/.claude/tools/cc_efficiency.py --days 7
 - `--model MODEL` -- model for dollar estimates: opus, sonnet, haiku (default: opus)
 - `--json` -- machine-readable output for further processing
 - `--project PATH` -- scan a specific project for .mcp.json and CLAUDE.md
+- `--refresh-pricing` -- force-refresh LiteLLM pricing cache (ignores 1-day TTL)
+- `--yield` -- correlate sessions with git commits; surface unproductive sessions (auto-included in -A)
 
-## What It Detects (21 Patterns)
+## What It Detects (22 Patterns)
 
 | # | Pattern | Token Cost |
 |---|---------|------------|
@@ -76,3 +78,4 @@ python ~/.claude/tools/cc_efficiency.py --days 7
 | 19 | Conversational Round-Trips (--deep) | ~5,000/round |
 | 20 | Model Selection Inefficiency | ~2-3K/session |
 | 21 | Prompt Cache Efficiency | ~11.5K/expiry |
+| 22 | Yield / Unproductive Sessions (--yield) | all tokens in session |
